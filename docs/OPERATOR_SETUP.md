@@ -2,8 +2,10 @@
 
 This setup runs the local companion as a per-user macOS LaunchAgent in
 `existing` mode. It reads verified ResumeGenerator and Outreach evidence, binds
-only to loopback, and cannot invoke the production pipeline. The upstream
-nightly scheduler remains the sole production-run owner.
+only to loopback, and enables only fixed, hash-bound reviewed actions. Generic
+live-run mode remains disabled. A reviewed safe-nightly action invokes the same
+attested scheduler wrapper with a fully fingerprinted prepare/generate argument
+set and all direct delivery flags omitted.
 
 ## Defaults
 
@@ -27,8 +29,9 @@ Override paths before probing or installing with
 `RECRUITING_ENGINE_COMPANION_PYTHON`, or `RECRUITING_ENGINE_DATA_DIR`.
 Overrides must be absolute. `RECRUITING_ENGINE_PORT` and
 `RECRUITING_ENGINE_HOSTED_ORIGIN` are also supported. The start script forces
-existing mode, disables live production execution, and rejects non-loopback
-hosts.
+existing mode, sets `RECRUITING_ENGINE_ALLOW_LIVE_RUNS=0`, explicitly enables
+the narrower `RECRUITING_ENGINE_ALLOW_REVIEWED_ACTIONS=1`, and rejects
+non-loopback hosts.
 
 ## Validate and install
 
@@ -71,6 +74,11 @@ scripts/start-operator-companion.sh rotate-pairing
 
 Treat the printed pairing code as a secret. These commands never place it in
 the plist or service logs.
+
+A pairing code is consumed once. After a successful exchange, the hosted tab
+uses a short-lived `re_web_` session and Settings shows **Connected**. Do not
+paste the same `re_pair_` value again; disconnect the tab and rotate the pairing
+code only when a new session is actually needed.
 
 The plist on disk and `launchctl print` describe different things: the former is
 the next load configuration, while the latter is the currently loaded job.

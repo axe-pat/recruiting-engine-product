@@ -106,9 +106,14 @@ python3 -m recruiting_companion serve
 ```
 
 The adapter follows exact run pointers and refuses mutable `latest`/`current`
-aliases. Bounded local projections and fixed, confirmed actions are available;
-arbitrary commands, external sends, final submission, and full nightly execution
-are not. The installed scheduler remains the only production-run owner. See the
+aliases. Bounded local projections, a durable exact-target review ledger, and
+fixed confirmed actions are available. Applied/closed lifecycle transitions use
+the artifact-preserving upstream contract. Recipient-bound delivery and the
+no-delivery safe nightly execute only after one exact target is reviewed and
+approved and their installed readiness checks pass. The browser-fill lane stays
+blocked because the installed runner cannot technically intercept final Submit;
+a prompt-only stop rule is not treated as a safety boundary. LinkedIn and SMTP
+completion require exact outcome artifacts. Arbitrary commands never exist. See the
 [operator cockpit contract](docs/OPERATOR_COCKPIT.md),
 [the adapter contract](docs/EXISTING_ENGINE_ADAPTER.md) and
 [run-evidence contract](docs/RUN_EVIDENCE_CONTRACT.md).

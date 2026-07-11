@@ -104,7 +104,10 @@ class ExistingEngineAdapter:
             "live_run": {
                 "environment_enabled": self.settings.allow_live_runs,
                 "supported": False,
-                "reason": "This companion build never invokes the production pipeline.",
+                "reason": (
+                    "Generic live-run mode is disabled. The separate operator "
+                    "review ledger may expose one fixed safe-nightly action."
+                ),
             },
             "busy": False,
             "locks": self._lock_states(),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import fcntl
+import hashlib
 import http.client
 import json
 import subprocess
@@ -715,6 +716,8 @@ class APITestCase(unittest.TestCase):
             ("GET", "/api/v1/operator/overview", None),
             ("GET", "/api/v1/operator/capabilities", None),
             ("GET", "/api/v1/operator/assets", None),
+            ("GET", "/api/v1/operator/review-targets", None),
+            ("GET", "/api/v1/operator/reviews", None),
             ("GET", "/api/v1/operator/jobs", None),
             (
                 "PUT",
@@ -760,23 +763,41 @@ class APITestCase(unittest.TestCase):
             )
             self.assertIn(allowed_status, {200, 201}, path)
 
+        status, detail_missing, _ = self.request(
+            "GET",
+            "/api/v1/operator/review-targets/target_aaaaaaaaaaaaaaaaaaaaaaaa/detail",
+            bearer=web_bearer,
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(detail_missing["error"]["code"], "not_found")
+        status, review_missing, _ = self.request(
+            "GET",
+            "/api/v1/operator/reviews/review_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            bearer=web_bearer,
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(review_missing["error"]["code"], "not_found")
+        status, injected_review, _ = self.request(
+            "POST",
+            "/api/v1/operator/reviews",
+            bearer=web_bearer,
+            body={
+                "command_id": "nightly.run",
+                "target_id": "target_aaaaaaaaaaaaaaaaaaaaaaaa",
+                "path": "/tmp/injected",
+            },
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(injected_review["error"]["code"], "validation_error")
+
         status, blocked_job, _ = self.request(
             "POST",
             "/api/v1/operator/jobs",
             bearer=web_bearer,
             body={"command_id": "nightly.run", "confirmation": ""},
         )
-        self.assertEqual(status, 201)
-        operator_job = blocked_job["operator_job"]
-        self.assertEqual(operator_job["status"], "blocked")
-        self.assertEqual(operator_job["result_code"], "capability_forbidden")
-        status, fetched_job, _ = self.request(
-            "GET",
-            f"/api/v1/operator/jobs/{operator_job['id']}",
-            bearer=web_bearer,
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(fetched_job["operator_job"]["id"], operator_job["id"])
+        self.assertEqual(status, 422)
+        self.assertEqual(blocked_job["error"]["code"], "validation_error")
         status, rejected_job, _ = self.request(
             "POST",
             "/api/v1/operator/jobs",
@@ -993,7 +1014,11 @@ class OperatorBackendTestCase(unittest.TestCase):
             self.assertEqual(commands["production.preflight"]["status"], "available")
             self.assertEqual(commands["reports.daily.refresh"]["status"], "unavailable")
             self.assertEqual(commands["reports.sources.refresh"]["status"], "unavailable")
-            self.assertEqual(commands["nightly.run"]["status"], "forbidden")
+            self.assertEqual(commands["nightly.run"]["status"], "unavailable")
+            self.assertIn(
+                "reviewed actions are disabled",
+                commands["nightly.run"]["reason"],
+            )
 
             completed = subprocess.CompletedProcess(
                 args=[],
@@ -1028,13 +1053,12 @@ class OperatorBackendTestCase(unittest.TestCase):
             self.assertEqual(runner.call_args.kwargs["cwd"], resume.resolve())
             self.assertIs(runner.call_args.kwargs["shell"], False)
 
-            blocked = backend.submit_job(
-                command_id="nightly.run",
-                confirmation="",
-                requested_scope="web",
-            )
-            self.assertEqual(blocked["status"], "blocked")
-            self.assertEqual(blocked["result_code"], "capability_forbidden")
+            with self.assertRaises(ValidationError):
+                backend.submit_job(
+                    command_id="nightly.run",
+                    confirmation="RUN_REVIEWED_NIGHTLY",
+                    requested_scope="web",
+                )
             with self.assertRaises(ValidationError):
                 backend.submit_job(
                     command_id="production.preflight",
@@ -1547,6 +1571,924 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
             )
             self.assertNotIn("rtrvr_apply_runner.py", packet_argv)
             self.assertNotIn("--live", packet_argv)
+
+    def test_durable_exact_target_review_approval_and_consumption(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resume = root / "resume"
+            outreach = root / "outreach"
+            runtime = root / "runtime"
+            queue_root = resume / "apps" / "Apply queues" / "current_apply_queue"
+            folder = queue_root / "jobs" / "one-role"
+            folder.mkdir(parents=True)
+            (folder / "jd.txt").write_text("private role", encoding="utf-8")
+            resume_file = folder / "resume_one.pdf"
+            resume_file.write_bytes(b"reviewed resume v1")
+            (queue_root / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "queue_type": "current_apply_queue",
+                        "ready_count": 1,
+                        "manual_review_count": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (queue_root / "priority_order.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": 42,
+                            "company": "Example Company",
+                            "role_title": "Product Lead",
+                            "status": "generated",
+                            "queue_bucket": "new",
+                            "folder_path": "jobs/one-role",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            transition_script = resume / "discovery" / "scripts" / "transition_application.py"
+            transition_script.parent.mkdir(parents=True)
+            transition_script.write_text("# fixed lifecycle fixture\n", encoding="utf-8")
+            nightly_script = resume / "discovery" / "scripts" / "nightly_prompt.py"
+            nightly_script.write_text("# fixed nightly wrapper fixture\n", encoding="utf-8")
+            (resume / "discovery" / "scripts" / "run_nightly_pipeline.py").write_text(
+                "# fixed nightly pipeline fixture\n", encoding="utf-8"
+            )
+            resume_python = resume / "venv" / "bin" / "python"
+            resume_python.parent.mkdir(parents=True)
+            resume_python.symlink_to(sys.executable)
+            (outreach / "workspace").mkdir(parents=True)
+            runtime.mkdir()
+            for path in (
+                runtime / "nightly_scheduler.lock",
+                runtime / "nightly_pipeline.lock",
+                resume / "discovery" / ".jobs.lock",
+                queue_root.parent / ".current_apply_queue.lock",
+            ):
+                path.write_text("", encoding="utf-8")
+            attestation = root / "attestation.json"
+            attestation.write_text('{"release":"exact"}', encoding="utf-8")
+            backend = OperatorBackend(
+                Settings(
+                    data_dir=root / "data",
+                    user_id="review-ledger",
+                    resumegen_root=resume,
+                    outreach_root=outreach,
+                    runtime_dir=runtime,
+                    attestation_path=attestation,
+                    resume_python=resume_python,
+                    allow_reviewed_actions=True,
+                )
+            )
+
+            lanes = {
+                lane["command_id"]: lane
+                for lane in backend.review_targets()["lanes"]
+            }
+            self.assertEqual(
+                lanes["nightly.run"]["state"], "review_stage_available"
+            )
+            self.assertEqual(
+                lanes["application.assist.fill_to_review"]["targets_total"],
+                0,
+            )
+            self.assertIn(
+                "tool-enforced final-submit interceptor",
+                lanes["application.assist.fill_to_review"]["reason"],
+            )
+            self.assertEqual(
+                lanes["application.status.applied"]["targets_total"], 1
+            )
+            self.assertEqual(
+                lanes["application.status.closed"]["targets_total"], 1
+            )
+            self.assertEqual(
+                lanes["outreach.linkedin.send"]["targets_total"], 0
+            )
+            self.assertEqual(lanes["outreach.email.send"]["targets_total"], 0)
+
+            nightly_target = lanes["nightly.run"]["targets"][0]
+            expiring = backend.create_review(
+                command_id="nightly.run",
+                target_id=nightly_target["target_id"],
+                requested_scope="web",
+            )
+            with backend.db.transaction() as connection:
+                connection.execute(
+                    "UPDATE operator_reviews SET expires_at = ? WHERE id = ?",
+                    ("2000-01-01T00:00:00Z", expiring["id"]),
+                )
+            self.assertEqual(backend.get_review(expiring["id"])["state"], "expired")
+
+            expired_approval = backend.create_review(
+                command_id="nightly.run",
+                target_id=nightly_target["target_id"],
+                requested_scope="web",
+            )
+            expired_approval = backend.transition_review(
+                expired_approval["id"],
+                transition="review",
+                confirmation="REVIEW_EXACT_TARGET",
+                requested_scope="web",
+            )
+            expired_approval = backend.transition_review(
+                expired_approval["id"],
+                transition="approve",
+                confirmation="APPROVE_EXACT_TARGET",
+                requested_scope="web",
+            )
+            with backend.db.transaction() as connection:
+                connection.execute(
+                    "UPDATE operator_reviews SET expires_at = ? WHERE id = ?",
+                    ("2000-01-01T00:00:00Z", expired_approval["id"]),
+                )
+            with self.assertRaisesRegex(ConflictError, "current approved review"):
+                backend.submit_job(
+                    command_id="nightly.run",
+                    confirmation="RUN_REVIEWED_NIGHTLY",
+                    parameters={
+                        "review_id": expired_approval["id"],
+                        "target_id": nightly_target["target_id"],
+                    },
+                    requested_scope="web",
+                )
+            self.assertEqual(
+                backend._review_row(expired_approval["id"])["state"], "expired"
+            )
+
+            nightly_review = backend.create_review(
+                command_id="nightly.run",
+                target_id=nightly_target["target_id"],
+                requested_scope="web",
+            )
+            nightly_review = backend.transition_review(
+                nightly_review["id"],
+                transition="review",
+                confirmation="REVIEW_EXACT_TARGET",
+                requested_scope="web",
+            )
+            nightly_review = backend.transition_review(
+                nightly_review["id"],
+                transition="approve",
+                confirmation="APPROVE_EXACT_TARGET",
+                requested_scope="web",
+            )
+
+            nightly_calls = 0
+
+            def nightly_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+                nonlocal nightly_calls
+                nightly_calls += 1
+                if nightly_calls == 1:
+                    self.assertIn("--production-check-only", args[0])
+                    self.assertEqual(
+                        backend.get_review(nightly_review["id"])["state"], "approved"
+                    )
+                    return subprocess.CompletedProcess(
+                        args=args[0], returncode=0, stdout=b"preflight valid\n", stderr=b""
+                    )
+                self.assertEqual(
+                    backend.get_review(nightly_review["id"])["state"], "consumed"
+                )
+                with backend.settings.adapter_mutation_lock_path.open("r+b") as handle:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                return subprocess.CompletedProcess(
+                    args=args[0], returncode=0, stdout=b"safe nightly\n", stderr=b""
+                )
+
+            with patch(
+                "recruiting_companion.operator_backend.subprocess.run",
+                side_effect=nightly_run,
+            ) as nightly_runner:
+                nightly_job = backend.submit_job(
+                    command_id="nightly.run",
+                    confirmation="RUN_REVIEWED_NIGHTLY",
+                    parameters={
+                        "review_id": nightly_review["id"],
+                        "target_id": nightly_target["target_id"],
+                    },
+                    requested_scope="web",
+                )
+                nightly_job = self._wait_for_job(backend, nightly_job["id"])
+            self.assertEqual(nightly_job["result_code"], "reviewed_nightly_completed")
+            self.assertEqual(nightly_calls, 2)
+            nightly_argv = nightly_runner.call_args_list[-1].args[0]
+            self.assertEqual(nightly_argv[1], "discovery/scripts/nightly_prompt.py")
+            self.assertIn("--require-production-attestation", nightly_argv)
+            self.assertIn("--pipeline-args", nightly_argv)
+            pipeline_args = nightly_argv[nightly_argv.index("--pipeline-args") + 1]
+            self.assertIn("--execute-track-2-daily-plan", pipeline_args)
+            self.assertIn("--target-sends 0", pipeline_args)
+            self.assertNotIn("--execute-sends", pipeline_args)
+            self.assertNotIn("--track-2-send-linkedin", pipeline_args)
+            self.assertNotIn("--execute-linkedin-followups", pipeline_args)
+            self.assertIs(nightly_runner.call_args_list[-1].kwargs["shell"], False)
+            self.assertEqual(nightly_job["preflight_returncode"], 0)
+            self.assertTrue(nightly_job["preflight_stdout_sha256"])
+
+            failed_review = backend.create_review(
+                command_id="nightly.run",
+                target_id=nightly_target["target_id"],
+                requested_scope="web",
+            )
+            failed_review = backend.transition_review(
+                failed_review["id"],
+                transition="review",
+                confirmation="REVIEW_EXACT_TARGET",
+                requested_scope="web",
+            )
+            failed_review = backend.transition_review(
+                failed_review["id"],
+                transition="approve",
+                confirmation="APPROVE_EXACT_TARGET",
+                requested_scope="web",
+            )
+            with patch(
+                "recruiting_companion.operator_backend.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    args=[], returncode=78, stdout=b"", stderr=b"dirty checkout"
+                ),
+            ):
+                failed_job = backend.submit_job(
+                    command_id="nightly.run",
+                    confirmation="RUN_REVIEWED_NIGHTLY",
+                    parameters={
+                        "review_id": failed_review["id"],
+                        "target_id": nightly_target["target_id"],
+                    },
+                    requested_scope="web",
+                )
+                failed_job = self._wait_for_job(backend, failed_job["id"])
+            self.assertEqual(
+                failed_job["result_code"], "reviewed_nightly_preflight_failed"
+            )
+            self.assertEqual(
+                backend.get_review(failed_review["id"])["state"], "approved"
+            )
+
+            target = lanes["application.status.applied"]["targets"][0]
+            detail = backend.get_review_target_detail(target["target_id"])
+            self.assertEqual(detail["job_id"], 42)
+            self.assertIsNone(detail["recipient"])
+            self.assertIsNone(detail["draft_text"])
+            review = backend.create_review(
+                command_id="application.status.applied",
+                target_id=target["target_id"],
+                requested_scope="web",
+            )
+            self.assertEqual(review["state"], "pending")
+            self.assertEqual(len(review["events"]), 1)
+            with self.assertRaises(ValidationError):
+                backend.transition_review(
+                    review["id"],
+                    transition="review",
+                    confirmation="wrong",
+                    requested_scope="web",
+                )
+            review = backend.transition_review(
+                review["id"],
+                transition="review",
+                confirmation="REVIEW_EXACT_TARGET",
+                requested_scope="web",
+            )
+            self.assertEqual(review["state"], "reviewed")
+
+            resume_file.write_bytes(b"reviewed resume v2")
+            with self.assertRaisesRegex(ConflictError, "no longer current"):
+                backend.transition_review(
+                    review["id"],
+                    transition="approve",
+                    confirmation="APPROVE_EXACT_TARGET",
+                    requested_scope="web",
+                )
+            self.assertEqual(backend.get_review(review["id"])["state"], "stale")
+
+            refreshed_lanes = {
+                lane["command_id"]: lane
+                for lane in backend.review_targets()["lanes"]
+            }
+            refreshed_target = refreshed_lanes[
+                "application.status.applied"
+            ]["targets"][0]
+            self.assertNotEqual(refreshed_target["target_id"], target["target_id"])
+            status_target = refreshed_target
+            status_review = backend.create_review(
+                command_id="application.status.applied",
+                target_id=status_target["target_id"],
+                requested_scope="local",
+            )
+            duplicate_review = backend.create_review(
+                command_id="application.status.applied",
+                target_id=status_target["target_id"],
+                requested_scope="local",
+            )
+            self.assertEqual(duplicate_review["id"], status_review["id"])
+            with backend.db.connect() as connection:
+                review_indexes = {
+                    row["name"]: bool(row["unique"])
+                    for row in connection.execute(
+                        "PRAGMA index_list(operator_reviews)"
+                    ).fetchall()
+                }
+            self.assertTrue(
+                review_indexes.get("idx_operator_reviews_one_active")
+            )
+            status_review = backend.transition_review(
+                status_review["id"],
+                transition="review",
+                confirmation="REVIEW_EXACT_TARGET",
+                requested_scope="local",
+            )
+            status_review = backend.transition_review(
+                status_review["id"],
+                transition="approve",
+                confirmation="APPROVE_EXACT_TARGET",
+                requested_scope="local",
+            )
+            commands = {
+                item["command_id"]: item
+                for item in backend.capabilities()["commands"]
+            }
+            self.assertEqual(
+                commands["application.status.applied"]["status"], "available"
+            )
+            self.assertEqual(
+                commands["application.assist.fill_to_review"]["status"],
+                "unavailable",
+            )
+            self.assertEqual(
+                commands["application.assist.fill_to_review"][
+                    "execution_contract"
+                ],
+                "blocked_final_submit_guard",
+            )
+
+            lifecycle_calls = 0
+            def lifecycle_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+                nonlocal lifecycle_calls
+                lifecycle_calls += 1
+                if "--production-check-only" in args[0]:
+                    self.assertEqual(
+                        backend.get_review(status_review["id"])["state"],
+                        "approved",
+                    )
+                    return subprocess.CompletedProcess(
+                        args=args[0], returncode=0, stdout=b"preflight valid\n", stderr=b""
+                    )
+                self.assertEqual(
+                    backend.get_review(status_review["id"])["state"], "consumed"
+                )
+                return subprocess.CompletedProcess(
+                    args=args[0], returncode=0, stdout=b'{"status":"applied"}\n', stderr=b""
+                )
+
+            with patch(
+                "recruiting_companion.operator_backend.subprocess.run",
+                side_effect=lifecycle_run,
+            ) as runner:
+                lifecycle_job = backend.submit_job(
+                    command_id="application.status.applied",
+                    confirmation="ARCHIVE_ONE_REVIEWED_APPLICATION_AS_APPLIED",
+                    parameters={
+                        "review_id": status_review["id"],
+                        "target_id": status_target["target_id"],
+                    },
+                    requested_scope="local",
+                )
+                lifecycle_job = self._wait_for_job(backend, lifecycle_job["id"])
+            self.assertEqual(lifecycle_job["status"], "completed")
+            self.assertEqual(lifecycle_calls, 2)
+            self.assertIn(
+                "--production-check-only",
+                runner.call_args_list[0].args[0],
+            )
+            self.assertEqual(
+                lifecycle_job["result_code"], "application_archived_applied"
+            )
+            self.assertEqual(
+                runner.call_args.args[0],
+                [
+                    str(resume_python.absolute()),
+                    "discovery/scripts/transition_application.py",
+                    "--id",
+                    "42",
+                    "--status",
+                    "applied",
+                    "--confirm",
+                    "APPLY 42",
+                    "--external-operator-lock",
+                    "--json",
+                ],
+            )
+            self.assertIs(runner.call_args.kwargs["shell"], False)
+            self.assertEqual(
+                backend.get_review(status_review["id"])["state"], "consumed"
+            )
+            replay = backend.submit_job
+            with self.assertRaises(ConflictError):
+                replay(
+                    command_id="application.status.applied",
+                    confirmation="ARCHIVE_ONE_REVIEWED_APPLICATION_AS_APPLIED",
+                    parameters={
+                        "review_id": status_review["id"],
+                        "target_id": status_target["target_id"],
+                    },
+                    requested_scope="local",
+                )
+
+            preflight_blocked = backend.create_review(
+                command_id="application.status.applied",
+                target_id=status_target["target_id"],
+                requested_scope="local",
+            )
+            preflight_blocked = backend.transition_review(
+                preflight_blocked["id"],
+                transition="review",
+                confirmation="REVIEW_EXACT_TARGET",
+                requested_scope="local",
+            )
+            preflight_blocked = backend.transition_review(
+                preflight_blocked["id"],
+                transition="approve",
+                confirmation="APPROVE_EXACT_TARGET",
+                requested_scope="local",
+            )
+            with patch(
+                "recruiting_companion.operator_backend.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    args=[], returncode=78, stdout=b"", stderr=b"dirty release"
+                ),
+            ) as blocked_runner:
+                blocked_job = backend.submit_job(
+                    command_id="application.status.applied",
+                    confirmation="ARCHIVE_ONE_REVIEWED_APPLICATION_AS_APPLIED",
+                    parameters={
+                        "review_id": preflight_blocked["id"],
+                        "target_id": status_target["target_id"],
+                    },
+                    requested_scope="local",
+                )
+                blocked_job = self._wait_for_job(backend, blocked_job["id"])
+            self.assertEqual(blocked_runner.call_count, 1)
+            self.assertEqual(
+                blocked_job["result_code"], "reviewed_action_preflight_failed"
+            )
+            self.assertEqual(
+                backend.get_review(preflight_blocked["id"])["state"],
+                "approved",
+            )
+
+    def test_reviewed_email_completion_requires_exact_send_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outreach = root / "outreach"
+            artifacts = outreach / "artifacts"
+            private = root / "private"
+            artifacts.mkdir(parents=True)
+            private.mkdir()
+            draft_path = private / "approved-email.json"
+            draft_path.write_text('{"results": []}\n', encoding="utf-8")
+            expected = {
+                "organization_id": "org-1",
+                "contact_id": "contact-1",
+                "email": "person@example.test",
+                "subject": "Reviewed subject",
+                "body": "Reviewed body",
+            }
+            result_path = artifacts / "track-2-email-send-results-exact.json"
+
+            def completed_for(payload: dict[str, object]) -> subprocess.CompletedProcess:
+                result_path.write_text(json.dumps(payload), encoding="utf-8")
+                return subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=f"Eligible: 1; held: 0; sent: 1\nArtifact: {result_path}\n".encode(),
+                    stderr=b"",
+                )
+
+            sent_payload: dict[str, object] = {
+                "source_artifact": str(draft_path),
+                "execute": True,
+                "eligible": 1,
+                "held": 0,
+                "sent": 1,
+                "results": [{**expected, "delivery_status": "sent"}],
+            }
+            self.assertEqual(
+                OperatorBackend._reviewed_email_delivery_evidence(
+                    completed_for(sent_payload),
+                    outreach_root=outreach,
+                    draft_path=draft_path,
+                    expected_draft=expected,
+                ),
+                "sent",
+            )
+
+            held_payload = {
+                **sent_payload,
+                "eligible": 0,
+                "held": 1,
+                "sent": 0,
+                "results": [
+                    {**expected, "delivery_status": "cadence_blocked"}
+                ],
+            }
+            self.assertEqual(
+                OperatorBackend._reviewed_email_delivery_evidence(
+                    completed_for(held_payload),
+                    outreach_root=outreach,
+                    draft_path=draft_path,
+                    expected_draft=expected,
+                ),
+                "not_sent",
+            )
+
+            contradictory_payload = {
+                **sent_payload,
+                "sent": 0,
+                "results": [{**expected, "delivery_status": "sent"}],
+            }
+            self.assertEqual(
+                OperatorBackend._reviewed_email_delivery_evidence(
+                    completed_for(contradictory_payload),
+                    outreach_root=outreach,
+                    draft_path=draft_path,
+                    expected_draft=expected,
+                ),
+                "unknown",
+            )
+
+    def test_exact_run_outreach_review_detail_and_pointer_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resume = root / "resume"
+            outreach = root / "outreach"
+            runtime = root / "runtime"
+            validation = resume / "discovery" / "source_validation"
+            artifacts = outreach / "artifacts"
+            workspace = outreach / "workspace"
+            validation.mkdir(parents=True)
+            artifacts.mkdir(parents=True)
+            workspace.mkdir()
+            reviewed_module = outreach / "src" / "outreach" / "reviewed_linkedin.py"
+            reviewed_module.parent.mkdir(parents=True)
+            reviewed_module.write_text("# reviewed LinkedIn fixture\n", encoding="utf-8")
+            outreach_python = outreach / ".venv" / "bin" / "python"
+            outreach_python.parent.mkdir(parents=True)
+            outreach_python.symlink_to(sys.executable)
+            nightly_wrapper = resume / "discovery" / "scripts" / "nightly_prompt.py"
+            nightly_wrapper.parent.mkdir(parents=True)
+            nightly_wrapper.write_text("# production preflight fixture\n", encoding="utf-8")
+            resume_python = resume / "venv" / "bin" / "python"
+            resume_python.parent.mkdir(parents=True)
+            resume_python.symlink_to(sys.executable)
+            (outreach / "main.py").write_text("# Outreach fixture\n", encoding="utf-8")
+            runtime.mkdir()
+            queue_parent = resume / "apps" / "Apply queues"
+            queue_parent.mkdir(parents=True)
+            for path in (
+                runtime / "nightly_scheduler.lock",
+                runtime / "nightly_pipeline.lock",
+                resume / "discovery" / ".jobs.lock",
+                queue_parent / ".current_apply_queue.lock",
+            ):
+                path.write_text("", encoding="utf-8")
+            attestation = root / "attestation.json"
+            attestation.write_text("{}", encoding="utf-8")
+
+            invite_path = artifacts / "20260711-invite-pipeline.json"
+            invite_path.write_text(
+                json.dumps(
+                    {
+                        "company": "Private Invite Co",
+                        "company_mode": True,
+                        "results": [
+                            {
+                                "linkedin_url": "https://www.linkedin.com/in/private-invite",
+                                "name": "Private Invite Person",
+                                "note": "PRIVATE INVITE NOTE",
+                                "score": 91,
+                                "note_qc": {"verdict": "send"},
+                                "target_company_match": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            followup_path = workspace / "20260711-followups.json"
+            followup_path.write_text(
+                json.dumps(
+                    {
+                        "results": [
+                            {
+                                "contact_id": "contact-1",
+                                "thread_id": "thread-1",
+                                "linkedin_url": "https://linkedin.com/in/private-followup",
+                                "name": "Private Followup Person",
+                                "company": "Private Followup Co",
+                                "draft_message": "PRIVATE FOLLOWUP DRAFT",
+                                "send_recommendation": "send",
+                                "communication_recommendation": "send",
+                                "latest_message": "PRIVATE LATEST INBOUND",
+                                "message_window": ["context"],
+                                "draft_kind": "reply",
+                                "source_status": "ready",
+                                "thread_url": "https://linkedin.com/messaging/thread/thread-1",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            email_path = workspace / "20260711-email-drafts.json"
+            email_path.write_text(
+                json.dumps(
+                    {
+                        "results": [
+                            {
+                                "organization_id": "org-1",
+                                "contact_id": "contact-2",
+                                "email": "private@example.test",
+                                "subject": "PRIVATE SUBJECT",
+                                "body": "PRIVATE EMAIL BODY",
+                                "company": "Private Email Co",
+                                "name": "Private Email Person",
+                                "cadence_action": "initial",
+                                "communication_review": {"verdict": "pass"},
+                                "craft_review": {"verdict": "pass"},
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest_path = validation / "20260711-120000-daily-engine-manifest.json"
+
+            def write_manifest(email_pointer: str | Path) -> dict[str, object]:
+                manifest = {
+                    "run_id": "20260711-120000",
+                    "track_2_phase_artifacts": [str(invite_path)],
+                    "track_2_phase_results": [
+                        {
+                            "phase": "5_send_linkedin_invites",
+                            "runs": [
+                                {
+                                    "company": "Private Invite Co",
+                                    "pipeline_artifact": "artifacts/20260711-invite-pipeline.json",
+                                    "effective_min_score": 80,
+                                    "status": "ready",
+                                    "send_artifact": None,
+                                }
+                            ],
+                        }
+                    ],
+                    "linkedin_followup_draft_artifacts": [str(followup_path)],
+                    "track_2_email_draft_artifacts": [str(email_pointer)],
+                }
+                content = json.dumps(manifest).encode("utf-8")
+                manifest_path.write_bytes(content)
+                return {
+                    "run_id": "20260711-120000",
+                    "evidence": {
+                        "daily_manifest": {
+                            "path": manifest_path.relative_to(resume).as_posix(),
+                            "sha256": hashlib.sha256(content).hexdigest(),
+                        }
+                    },
+                }
+
+            settings = Settings(
+                data_dir=root / "data",
+                user_id="outreach-review",
+                resumegen_root=resume,
+                outreach_root=outreach,
+                runtime_dir=runtime,
+                attestation_path=attestation,
+                resume_python=resume_python,
+                outreach_python=outreach_python,
+                allow_reviewed_actions=True,
+            )
+            backend = OperatorBackend(settings)
+            projection = write_manifest(email_path)
+            with patch.object(
+                backend.adapter,
+                "verified_run_projections",
+                return_value=[projection],
+            ):
+                records, reasons = backend._outreach_review_target_records()
+                self.assertEqual(reasons["outreach.linkedin.send"], [])
+                self.assertEqual(reasons["outreach.email.send"], [])
+                self.assertEqual(
+                    sum(item["command_id"] == "outreach.linkedin.send" for item in records),
+                    2,
+                )
+                email_target = next(
+                    item for item in records if item["command_id"] == "outreach.email.send"
+                )
+                public = backend._public_review_target(email_target)
+                self.assertNotIn("PRIVATE EMAIL BODY", json.dumps(public))
+                self.assertNotIn("private@example.test", json.dumps(public))
+                detail = backend.get_review_target_detail(email_target["target_id"])
+                self.assertEqual(detail["recipient"], "Private Email Person <private@example.test>")
+                self.assertEqual(detail["subject"], "PRIVATE SUBJECT")
+                self.assertEqual(detail["draft_text"], "PRIVATE EMAIL BODY")
+                edited = backend.create_review(
+                    command_id="outreach.email.send",
+                    target_id=email_target["target_id"],
+                    requested_scope="web",
+                    reviewed_subject="EDITED PRIVATE SUBJECT",
+                    reviewed_text="EDITED PRIVATE EMAIL BODY",
+                )
+                edited_private, _ = backend.get_review_detail(edited["id"])
+                self.assertEqual(
+                    edited_private["reviewed_subject"], "EDITED PRIVATE SUBJECT"
+                )
+                self.assertEqual(
+                    edited_private["reviewed_text"], "EDITED PRIVATE EMAIL BODY"
+                )
+                self.assertNotIn(
+                    "EDITED PRIVATE EMAIL BODY", json.dumps(backend.list_reviews())
+                )
+                self.assertNotIn(
+                    "EDITED PRIVATE EMAIL BODY",
+                    json.dumps(backend.get_review(edited["id"])),
+                )
+                edited = backend.transition_review(
+                    edited["id"],
+                    transition="review",
+                    confirmation="REVIEW_EXACT_TARGET",
+                    requested_scope="web",
+                )
+                edited = backend.transition_review(
+                    edited["id"],
+                    transition="approve",
+                    confirmation="APPROVE_EXACT_TARGET",
+                    requested_scope="web",
+                )
+                approved_sha = edited["artifact_sha256"]
+                updated, updated_target = backend.update_review_content(
+                    edited["id"],
+                    reviewed_subject="SECOND PRIVATE SUBJECT",
+                    reviewed_text="SECOND PRIVATE EMAIL BODY",
+                    confirmation="UPDATE_EXACT_REVIEW_CONTENT",
+                    requested_scope="web",
+                )
+                self.assertEqual(updated["state"], "pending")
+                self.assertIsNone(updated["approved_at"])
+                self.assertNotEqual(updated["artifact_sha256"], approved_sha)
+                self.assertEqual(updated["reviewed_subject"], "SECOND PRIVATE SUBJECT")
+                self.assertEqual(updated_target["recipient"], detail["recipient"])
+                with self.assertRaises(ValidationError):
+                    backend.update_review_content(
+                        edited["id"],
+                        reviewed_subject="THIRD SUBJECT",
+                        reviewed_text="THIRD BODY",
+                        confirmation="wrong",
+                        requested_scope="web",
+                    )
+
+                invite_target = next(
+                    item
+                    for item in records
+                    if item["target_type"] == "linkedin_invite"
+                )
+                linkedin_review = backend.create_review(
+                    command_id="outreach.linkedin.send",
+                    target_id=invite_target["target_id"],
+                    requested_scope="web",
+                    reviewed_text="EDITED PRIVATE LINKEDIN NOTE",
+                )
+                linkedin_review = backend.transition_review(
+                    linkedin_review["id"],
+                    transition="review",
+                    confirmation="REVIEW_EXACT_TARGET",
+                    requested_scope="web",
+                )
+
+                linkedin_calls: list[list[str]] = []
+
+                def reviewed_linkedin_run(
+                    *args: object, **kwargs: object
+                ) -> subprocess.CompletedProcess:
+                    argv = list(args[0])
+                    linkedin_calls.append(argv)
+                    if "--production-check-only" in argv:
+                        pass
+                    elif "preview" in argv:
+                        output = Path(argv[argv.index("--output") + 1])
+                        output.write_text(
+                            json.dumps({"proposal_sha256": "a" * 64}),
+                            encoding="utf-8",
+                        )
+                    elif "approve" in argv:
+                        output = Path(argv[argv.index("--approval-file") + 1])
+                        output.write_text(
+                            json.dumps(
+                                {
+                                    "proposal_sha256": "a" * 64,
+                                    "approval_sha256": "b" * 64,
+                                }
+                            ),
+                            encoding="utf-8",
+                        )
+                    else:
+                        output = Path(argv[argv.index("--receipt-file") + 1])
+                        output.write_text(
+                            json.dumps(
+                                {
+                                    "status": "execution_completed",
+                                    "reconciliation_required": False,
+                                    "approval_sha256": "b" * 64,
+                                    "proposal_sha256": "a" * 64,
+                                }
+                            ),
+                            encoding="utf-8",
+                        )
+                    return subprocess.CompletedProcess(
+                        args=argv, returncode=0, stdout=b"private CLI output\n", stderr=b""
+                    )
+
+                with patch(
+                    "recruiting_companion.operator_backend.subprocess.run",
+                    side_effect=reviewed_linkedin_run,
+                ):
+                    linkedin_review = backend.transition_review(
+                        linkedin_review["id"],
+                        transition="approve",
+                        confirmation="APPROVE_EXACT_TARGET",
+                        requested_scope="web",
+                    )
+                    self.assertTrue(linkedin_review["execution_prepared"])
+                    linkedin_job = backend.submit_job(
+                        command_id="outreach.linkedin.send",
+                        confirmation="SEND_ONE_REVIEWED_LINKEDIN_MESSAGE",
+                        parameters={
+                            "review_id": linkedin_review["id"],
+                            "target_id": invite_target["target_id"],
+                        },
+                        requested_scope="web",
+                    )
+                    linkedin_job = self._wait_for_job(
+                        backend, linkedin_job["id"]
+                    )
+                self.assertEqual(
+                    linkedin_job["result_code"], "reviewed_linkedin_completed"
+                )
+                self.assertEqual(len(linkedin_calls), 5)
+                self.assertIn("--production-check-only", linkedin_calls[0])
+                self.assertIn("preview", linkedin_calls[1])
+                self.assertIn("approve", linkedin_calls[2])
+                self.assertIn("--production-check-only", linkedin_calls[3])
+                self.assertIn("execute", linkedin_calls[4])
+                self.assertNotIn("--ledger", linkedin_calls[4])
+                self.assertIn("--execute", linkedin_calls[4])
+                message_path = Path(
+                    linkedin_calls[1][
+                        linkedin_calls[1].index("--outgoing-message-file") + 1
+                    ]
+                )
+                self.assertEqual(
+                    message_path.read_text(encoding="utf-8"),
+                    "EDITED PRIVATE LINKEDIN NOTE",
+                )
+                self.assertEqual(
+                    backend.get_review(linkedin_review["id"])["state"],
+                    "consumed",
+                )
+                self.assertNotIn("private CLI output", json.dumps(linkedin_job))
+
+            outside = root / "pytest-pollution-email.json"
+            outside.write_text(email_path.read_text(encoding="utf-8"), encoding="utf-8")
+            polluted_projection = write_manifest(outside)
+            with patch.object(
+                backend.adapter,
+                "verified_run_projections",
+                return_value=[polluted_projection],
+            ):
+                records, reasons = backend._outreach_review_target_records()
+                self.assertFalse(
+                    any(item["command_id"] == "outreach.email.send" for item in records)
+                )
+                self.assertTrue(reasons["outreach.email.send"])
+
+            symlink_path = workspace / "20260711-email-symlink.json"
+            symlink_path.symlink_to(outside)
+            symlink_projection = write_manifest(symlink_path)
+            with patch.object(
+                backend.adapter,
+                "verified_run_projections",
+                return_value=[symlink_projection],
+            ):
+                records, reasons = backend._outreach_review_target_records()
+                self.assertFalse(
+                    any(item["command_id"] == "outreach.email.send" for item in records)
+                )
+                self.assertTrue(reasons["outreach.email.send"])
 
     @staticmethod
     def _wait_for_job(

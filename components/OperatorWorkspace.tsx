@@ -8,6 +8,11 @@ import type {
   OperatorOverview,
   OperatorQueueAction,
   OperatorQueueItem,
+  OperatorReview,
+  OperatorReviewLane,
+  OperatorReviewResult,
+  OperatorReviewTarget,
+  OperatorReviewTargetDetail,
 } from "@/lib/operator-contract";
 
 export type OperatorView =
@@ -27,7 +32,14 @@ type OperatorWorkspaceProps = {
   overview: OperatorOverview | null;
   connected: boolean;
   onAction: (commandId: string, confirmation: string, parameters?: Record<string, unknown>) => Promise<OperatorActionResult | null>;
+  onLoadReviewTarget: (targetId: string) => Promise<OperatorReviewTargetDetail | null>;
+  onLoadReview: (reviewId: string) => Promise<OperatorReviewResult | null>;
+  onCreateReview: (commandId: string, targetId: string, reviewedText: string, reviewedSubject: string) => Promise<OperatorReview | null>;
+  onUpdateReviewContent: (reviewId: string, reviewedText: string, reviewedSubject: string, confirmation: string) => Promise<OperatorReviewResult | null>;
+  onTransitionReview: (reviewId: string, transition: "review" | "approve" | "revoke", confirmation: string) => Promise<OperatorReview | null>;
 };
+
+const reviewContentUpdatePhrase = "UPDATE_EXACT_REVIEW_CONTENT";
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -87,6 +99,7 @@ function firstRecord(record: UnknownRecord, keys: string[]): UnknownRecord {
 
 function commandState(command: OperatorCommand): "available" | "blocked" | "disabled" {
   const state = command.state || command.status;
+  if (command.requires_approved_review) return "blocked";
   if (command.available === true || state === "available" || state === "ready" || state === "conditionally_available") return "available";
   if (command.risk === "external" || state === "forbidden") return "disabled";
   return "blocked";
@@ -105,9 +118,9 @@ const commandCopy: Record<string, [string, string]> = {
   "open.latest_report": ["Open latest exact report", "Open the newest fully verified run-scoped report."],
   "open.story_workbench": ["Open story workbench", "Open the private story and interview workspace locally."],
   "open.communication_review": ["Open communication review", "Open the current local draft-review artifact."],
-  "nightly.run": ["Run full nightly pipeline", "Disabled here because production arguments may include live sends."],
+  "nightly.run": ["Run reviewed nightly pipeline", "Run the fixed prepare/generate nightly after exact review; every delivery flag stays omitted."],
   "outreach.send": ["Send outreach", "Disabled in the generic cockpit command surface."],
-  "application.submit": ["Submit application", "Final application submission remains human-owned."],
+  "application.assist.fill_to_review": ["Application fill safety gate", "Blocked until the browser runner can technically intercept final Submit; prompt-only stopping is insufficient."],
 };
 
 function normalizeCommands(commands: OperatorCommand[]): OperatorCommand[] {
@@ -214,12 +227,29 @@ const viewCopy: Record<OperatorView, { eyebrow: string; title: string; body: str
   },
 };
 
-export function OperatorWorkspace({ view, overview, connected, onAction }: OperatorWorkspaceProps) {
+export function OperatorWorkspace({
+  view,
+  overview,
+  connected,
+  onAction,
+  onLoadReviewTarget,
+  onLoadReview,
+  onCreateReview,
+  onUpdateReviewContent,
+  onTransitionReview,
+}: OperatorWorkspaceProps) {
   const [selected, setSelected] = useState<OperatorCommand | null>(null);
   const [selectedParameters, setSelectedParameters] = useState<Record<string, unknown>>({});
   const [confirmation, setConfirmation] = useState("");
   const [executing, setExecuting] = useState(false);
   const [actionMessage, setActionMessage] = useState("");
+  const [reviewTarget, setReviewTarget] = useState<OperatorReviewTarget | null>(null);
+  const [reviewDetail, setReviewDetail] = useState<OperatorReviewTargetDetail | null>(null);
+  const [reviewRecord, setReviewRecord] = useState<OperatorReview | null>(null);
+  const [reviewedSubject, setReviewedSubject] = useState("");
+  const [reviewedText, setReviewedText] = useState("");
+  const [reviewConfirmation, setReviewConfirmation] = useState("");
+  const [reviewBusy, setReviewBusy] = useState(false);
 
   const assets = asRecord(overview?.assets);
   const workbooks = asRecord(assets.workbooks);
@@ -229,12 +259,155 @@ export function OperatorWorkspace({ view, overview, connected, onAction }: Opera
   const reports = asRecord(assets.daily_reports);
   const sources = asRecord(assets.source_metrics);
   const commands = normalizeCommands(overview?.capabilities?.commands ?? []);
+  const reviewLanes = overview?.review_queue?.lanes ?? [];
+  const recentReviews = overview?.review_queue?.recent_reviews ?? [];
   const items = queueItems(queue);
   const copy = viewCopy[view];
+  const visibleReviewLanes = reviewLanes.filter((lane) => {
+    if (view === "operations") return true;
+    if (view === "runs") return lane.command_id === "nightly.run";
+    if (view === "outreach") return lane.command_id.startsWith("outreach.");
+    if (view === "queue" || view === "applications") return lane.command_id.startsWith("application.");
+    return false;
+  });
+  const selectedReviewLane = reviewTarget
+    ? reviewLanes.find((lane) => lane.command_id === reviewTarget.command_id)
+    : undefined;
+  const reviewExecutionAvailable = selectedReviewLane?.execution_state === "available";
+  const transitionReviewPhrase = !reviewRecord
+    ? ""
+    : reviewRecord.state === "pending"
+      ? reviewRecord.review_confirmation_phrase || "REVIEW_EXACT_TARGET"
+      : reviewRecord.state === "reviewed"
+        ? reviewRecord.approval_confirmation_phrase || "APPROVE_EXACT_TARGET"
+        : reviewExecutionAvailable
+          ? reviewRecord.action_confirmation_phrase || reviewRecord.command_id
+          : reviewRecord.revocation_confirmation_phrase || "REVOKE_EXACT_TARGET";
+  const reviewChannel = String(reviewDetail?.channel || reviewRecord?.channel || reviewTarget?.channel || "").toLowerCase();
+  const reviewTargetType = String(reviewDetail?.target_type || reviewRecord?.target_type || reviewTarget?.target_type || "").toLowerCase();
+  const isEmailReview = reviewChannel === "email" || reviewTargetType.includes("email");
+  const isLinkedInReview = reviewChannel === "linkedin" || reviewTargetType.includes("linkedin");
+  const hasEditableReviewContent = isEmailReview || isLinkedInReview;
+  const reviewContentChanged = Boolean(
+    reviewRecord
+    && hasEditableReviewContent
+    && (
+      reviewedText !== (reviewDetail?.draft_text || "")
+      || reviewedSubject !== (reviewDetail?.subject || "")
+    )
+  );
+  const reviewPhrase = reviewContentChanged ? reviewContentUpdatePhrase : transitionReviewPhrase;
+  const reviewContentValid = !hasEditableReviewContent
+    || (Boolean(reviewedText.trim()) && (!isEmailReview || Boolean(reviewedSubject.trim())));
 
   const selectCommand = (command: OperatorCommand, parameters: Record<string, unknown> = {}) => {
     setSelectedParameters(parameters);
     setSelected(command);
+  };
+
+  const selectReviewTarget = async (target: OperatorReviewTarget) => {
+    setReviewBusy(true);
+    setReviewConfirmation("");
+    const existing = recentReviews.find((review) =>
+      review.command_id === target.command_id
+      && review.target_id === target.target_id
+      && ["pending", "reviewed", "approved"].includes(review.state));
+    const storedReview = existing ? await onLoadReview(existing.id) : null;
+    const loadedDetail = existing ? storedReview?.review_target ?? null : await onLoadReviewTarget(target.target_id);
+    if (loadedDetail) {
+      const storesOutgoingContent = target.command_id === "outreach.linkedin.send" || target.command_id === "outreach.email.send";
+      const detail = storesOutgoingContent && storedReview?.operator_review
+        ? {
+            ...loadedDetail,
+            subject: storedReview.operator_review.reviewed_subject ?? loadedDetail.subject,
+            draft_text: storedReview.operator_review.reviewed_text ?? loadedDetail.draft_text,
+          }
+        : loadedDetail;
+      setReviewTarget(target);
+      setReviewDetail(detail);
+      setReviewRecord(storedReview?.operator_review ?? existing ?? null);
+      setReviewedSubject(detail.subject || "");
+      setReviewedText(detail.draft_text || "");
+    }
+    setReviewBusy(false);
+  };
+
+  const advanceReview = async () => {
+    if (!reviewTarget) return;
+    setReviewBusy(true);
+    let next = reviewRecord;
+    if (!next) {
+      next = await onCreateReview(
+        reviewTarget.command_id,
+        reviewTarget.target_id,
+        hasEditableReviewContent ? reviewedText : "",
+        isEmailReview ? reviewedSubject : "",
+      );
+      if (next && reviewDetail) {
+        setReviewDetail({ ...reviewDetail, draft_text: reviewedText, subject: reviewedSubject });
+      }
+    } else if (reviewContentChanged) {
+      const updated = await onUpdateReviewContent(
+        next.id,
+        reviewedText,
+        reviewedSubject,
+        reviewConfirmation,
+      );
+      if (updated?.operator_review) {
+        const detailBase = updated.review_target || reviewDetail;
+        const nextDetail = detailBase
+          ? {
+              ...detailBase,
+              draft_text: updated.operator_review.reviewed_text ?? reviewedText,
+              subject: updated.operator_review.reviewed_subject ?? reviewedSubject,
+            }
+          : null;
+        setReviewRecord(updated.operator_review);
+        setReviewDetail(nextDetail);
+        setReviewedSubject(nextDetail?.subject || "");
+        setReviewedText(nextDetail?.draft_text || "");
+        setReviewConfirmation("");
+        setActionMessage("Exact outgoing content updated. The review is pending again and must be reviewed and approved before execution.");
+      }
+      setReviewBusy(false);
+      return;
+    } else if (next.state === "pending") {
+      next = await onTransitionReview(next.id, "review", reviewConfirmation);
+    } else if (next.state === "reviewed") {
+      next = await onTransitionReview(next.id, "approve", reviewConfirmation);
+    } else if (next.state === "approved" && reviewExecutionAvailable) {
+      const result = await onAction(
+        next.command_id,
+        reviewConfirmation,
+        { review_id: next.id, target_id: next.target_id },
+      );
+      const job = result?.job || result?.operator_job;
+      if (job) {
+        setActionMessage(job.summary || `Reviewed action ${job.status || "accepted"}.`);
+        setReviewTarget(null);
+        setReviewDetail(null);
+        setReviewRecord(null);
+        setReviewedSubject("");
+        setReviewedText("");
+        setReviewConfirmation("");
+      }
+      setReviewBusy(false);
+      return;
+    } else if (next.state === "approved") {
+      next = await onTransitionReview(next.id, "revoke", reviewConfirmation);
+    }
+    if (next) {
+      setReviewRecord(next);
+      setReviewConfirmation("");
+      setActionMessage(
+        next.state === "approved"
+          ? reviewLanes.find((lane) => lane.command_id === next?.command_id)?.execution_state === "available"
+            ? "Exact target approved and hash-bound. Its fixed guarded action is ready for a separate typed confirmation."
+            : "Exact target approved and hash-bound. The execution gate remains closed until its installed contract is proven."
+          : `Review is now ${next.state}.`,
+      );
+    }
+    setReviewBusy(false);
   };
 
   if (!connected || !overview) {
@@ -287,6 +460,15 @@ export function OperatorWorkspace({ view, overview, connected, onAction }: Opera
       {view === "runs" ? <VerifiedRunsSurface reports={reports} sources={sources} commands={commands} onSelect={selectCommand} /> : null}
       {view === "operations" ? <OperationsSurface overview={overview} commands={commands} onSelect={selectCommand} /> : null}
 
+      {visibleReviewLanes.length ? (
+        <ReviewQueue
+          lanes={visibleReviewLanes}
+          reviews={recentReviews}
+          onSelect={selectReviewTarget}
+          loading={reviewBusy}
+        />
+      ) : null}
+
       {selected ? (
         <div className="operator-dialog-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.currentTarget === event.target && !executing) {
@@ -310,6 +492,45 @@ export function OperatorWorkspace({ view, overview, connected, onAction }: Opera
           </section>
         </div>
       ) : null}
+
+      {reviewTarget && reviewDetail ? (
+        <div className="operator-dialog-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.currentTarget === event.target && !reviewBusy) {
+            setReviewTarget(null);
+            setReviewDetail(null);
+            setReviewRecord(null);
+            setReviewedSubject("");
+            setReviewedText("");
+            setReviewConfirmation("");
+          }
+        }}>
+          <section className="operator-dialog operator-review-dialog" role="dialog" aria-modal="true" aria-labelledby="operator-review-title">
+            <button type="button" onClick={() => { setReviewTarget(null); setReviewDetail(null); setReviewRecord(null); setReviewedSubject(""); setReviewedText(""); setReviewConfirmation(""); }} disabled={reviewBusy} aria-label="Close exact target review">×</button>
+            <span className={`operator-command-state review-state-${reviewRecord?.state || "unstaged"}`}>{reviewRecord?.state || "Unstaged exact target"}</span>
+            <h3 id="operator-review-title">{reviewDetail.label || reviewTarget.label}</h3>
+            <p>{reviewDetail.detail || reviewTarget.detail}</p>
+            <div className="operator-review-binding">
+              <div><span>Capability</span><strong>{reviewTarget.command_id}</strong></div>
+              {reviewDetail.job_id ? <div><span>Exact job</span><strong>#{reviewDetail.job_id}</strong></div> : null}
+              <div><span>Artifact fingerprint</span><code>{(reviewRecord?.artifact_sha256 || reviewDetail.artifact_sha256)?.slice(0, 20)}…</code></div>
+              <div><span>Bounded execution</span><strong>One target maximum</strong></div>
+            </div>
+            {reviewDetail.recipient ? <section className="operator-sensitive-review"><span>Exact recipient · immutable</span><strong>{reviewDetail.recipient}</strong></section> : null}
+            {isEmailReview ? (
+              <label className="operator-sensitive-review operator-editable-review"><span>Exact email subject · editable</span><input type="text" value={reviewedSubject} onChange={(event) => { setReviewedSubject(event.target.value); setReviewConfirmation(""); }} disabled={reviewBusy} autoComplete="off" /></label>
+            ) : reviewDetail.subject ? <section className="operator-sensitive-review"><span>Exact subject</span><strong>{reviewDetail.subject}</strong></section> : null}
+            {hasEditableReviewContent ? (
+              <label className="operator-sensitive-review operator-editable-review"><span>{isEmailReview ? "Exact email body · editable" : "Exact LinkedIn body · editable"}</span><textarea value={reviewedText} onChange={(event) => { setReviewedText(event.target.value); setReviewConfirmation(""); }} disabled={reviewBusy} /></label>
+            ) : reviewDetail.draft_text ? <section className="operator-sensitive-review"><span>Exact draft text</span><pre>{reviewDetail.draft_text}</pre></section> : null}
+            {reviewDetail.context ? <section className="operator-sensitive-review"><span>Bound context · immutable</span><pre>{reviewDetail.context}</pre></section> : null}
+            {reviewRecord ? (
+              <label>Type <strong>{reviewPhrase}</strong> to {reviewContentChanged ? "replace the stored exact content and reset approval" : reviewRecord.state === "pending" ? "record review" : reviewRecord.state === "reviewed" ? "approve" : reviewExecutionAvailable ? "run this separately confirmed action" : "revoke approval"}<input value={reviewConfirmation} onChange={(event) => setReviewConfirmation(event.target.value)} autoFocus /></label>
+            ) : null}
+            <button className="operator-confirm-button" type="button" onClick={advanceReview} disabled={reviewBusy || !reviewContentValid || Boolean(reviewRecord && reviewConfirmation !== reviewPhrase)}>{reviewBusy ? "Recording…" : !reviewRecord ? "Stage exact content" : reviewContentChanged ? "Update exact review content" : reviewRecord.state === "pending" ? "Record reviewed" : reviewRecord.state === "reviewed" ? "Approve exact target" : reviewExecutionAvailable ? "Run reviewed action" : "Revoke approval"}</button>
+            <small>{reviewDetail.content_binding} Recipient and context remain immutable. Exact content is fetched only for this authenticated dialog and is never included in the overview or browser session storage.</small>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -323,7 +544,7 @@ function OperatorGuard({ overview }: { overview: OperatorOverview }) {
     <aside className={`operator-guard ${guardState === "ready" ? "guard-ready" : "guard-busy"}`}>
       <span><i />{busy ? "Production work in progress" : allFree ? "Local systems available" : "Local guards need attention"}</span>
       <strong>{overview.guard?.production_guard === "configured" ? "Release attestation configured" : "Release attestation unavailable"}</strong>
-      <small>{busy ? "Immutable run evidence remains readable; mutable queue and workbook projections pause." : `${Object.keys(locks).length} lock boundaries reported · external sends disabled`}</small>
+      <small>{busy ? "Immutable run evidence remains readable; mutable queue and workbook projections pause." : `${Object.keys(locks).length} lock boundaries reported · ${overview.guard?.external_actions === "reviewed-single-target-only" ? "reviewed one-target actions only" : "external actions disabled"}`}</small>
     </aside>
   );
 }
@@ -423,7 +644,7 @@ function ApplyQueueSurface({ queue, items, commands, onSelect }: { queue: Unknow
       </section>
       {truncated ? <p className="operator-boundary-note">This is a bounded projection showing {itemsReturned} of {itemsTotal} queue rows. Open the local queue for the complete ordering.</p> : null}
       <CommandSection title="Application controls" commands={generalCommands} onSelect={onSelect} />
-      <p className="operator-boundary-note">Status changes are intentionally unavailable until artifact-preserving archive semantics are guaranteed. “Applied” must never make a generated resume disappear.</p>
+      <p className="operator-boundary-note">Applied and closed transitions use an exact-target, archive-first review flow that preserves generated artifacts before the current queue changes. Final application Submit remains human-owned.</p>
     </>
   );
 }
@@ -485,7 +706,7 @@ function CommunicationSurface({ storyComms, commands, onSelect }: { storyComms: 
       <section className="operator-metrics"><article><span>Sends recorded</span><strong>{number(totals.sends)}</strong><small>Delivery evidence</small></article><article><span>Accepts</span><strong>{number(totals.accepts)}</strong><small>{text(totals.accept_rate, "—")} rate</small></article><article><span>Replies</span><strong>{number(totals.replies)}</strong><small>{text(totals.reply_rate, "—")} rate</small></article><article><span>Pending review</span><strong>{number(comms.pending_review_count)}</strong><small>Recommendation gap</small></article></section>
       <section className="operator-split"><div className="operator-panel"><div className="operator-panel-head"><div><span>Recommendation state</span><h3>Outcome-learning aggregates</h3></div><small>No drafts or message bodies</small></div><OperatorRows items={aggregateRows} empty="No communication aggregates are available." /></div><aside className="operator-panel operator-breakdown"><span>Evidence mix</span><h3>Corpus and review decisions</h3><Breakdown title="Corpus labels" data={corpusCounts} /><Breakdown title="Review decisions" data={decisionCounts} /></aside></section>
       <CommandSection title="Communication controls" commands={commands.filter((command) => command.id.includes("communication") || command.id.includes("comms") || command.id.includes("outreach"))} onSelect={onSelect} />
-      <p className="operator-boundary-note">This projection reports aggregate outcomes and recommendation-review state only. It does not claim to be a draft queue, and external sends stay disabled in this cockpit release.</p>
+      <p className="operator-boundary-note">The aggregate projection is not a draft queue. Exact-run recipient and message detail appears only after selecting one authenticated review target below; generic or unreviewed sends remain impossible.</p>
     </>
   );
 }
@@ -541,6 +762,61 @@ function ReportRows({ items }: { items: UnknownRecord[] }) {
   })}</div>;
 }
 
+function ReviewQueue({
+  lanes,
+  reviews,
+  onSelect,
+  loading,
+}: {
+  lanes: OperatorReviewLane[];
+  reviews: OperatorReview[];
+  onSelect: (target: OperatorReviewTarget) => void;
+  loading: boolean;
+}) {
+  const reviewByTarget = new Map(
+    reviews
+      .filter((review) => ["pending", "reviewed", "approved"].includes(review.state))
+      .map((review) => [`${review.command_id}:${review.target_id}`, review]),
+  );
+  return (
+    <section className="operator-panel operator-review-queue">
+      <div className="operator-panel-head">
+        <div><span>Human-owned review gates</span><h3>Exact targets before consequential action</h3></div>
+        <small>One target · 24-hour approval · hash-bound</small>
+      </div>
+      <div className="operator-review-lanes">
+        {lanes.map((lane) => (
+          <article key={lane.command_id} className="operator-review-lane">
+            <header>
+              <div><span>{lane.category || "review"}</span><strong>{lane.label || lane.command_id}</strong></div>
+              <small className={`review-lane-state lane-${lane.state || "waiting_for_contract"}`}>{lane.state === "review_stage_available" ? "Review available" : "Waiting for contract"}</small>
+            </header>
+            <p>{lane.description}</p>
+            {(lane.targets ?? []).length ? (
+              <div className="operator-review-targets">
+                {(lane.targets ?? []).slice(0, 8).map((target) => {
+                  const review = reviewByTarget.get(`${lane.command_id}:${target.target_id}`);
+                  return (
+                    <button key={target.target_id} type="button" disabled={loading} onClick={() => onSelect(target)}>
+                      <span>{review?.state || "unreviewed"}</span>
+                      <strong>{target.label || target.target_id}</strong>
+                      <small>{target.detail || "Open exact private review detail."}</small>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="operator-review-blocked"><strong>No eligible exact target</strong><p>{lane.reason || "The installed source contract is not yet proven."}</p></div>
+            )}
+            <footer><span>{lane.targets_returned ?? 0} target{lane.targets_returned === 1 ? "" : "s"}</span><strong>Execution: {lane.execution_state?.replaceAll("_", " ") || "blocked"}</strong></footer>
+          </article>
+        ))}
+      </div>
+      <p className="operator-boundary-note">Review and approval never imply execution. A changed artifact, recipient, thread, or text invalidates the target hash; uncertain delivery is consumed and reconciled instead of silently retried.</p>
+    </section>
+  );
+}
+
 function OperationsSurface({ overview, commands, onSelect }: { overview: OperatorOverview; commands: OperatorCommand[]; onSelect: (command: OperatorCommand) => void }) {
   const locks = overview.guard?.locks ?? {};
   const jobs = overview.recent_jobs ?? [];
@@ -548,7 +824,7 @@ function OperationsSurface({ overview, commands, onSelect }: { overview: Operato
     <>
       <section className="operator-split"><div className="operator-panel"><div className="operator-panel-head"><div><span>Capability registry</span><h3>Fixed local actions</h3></div></div><CommandButtons commands={commands} onSelect={onSelect} full /></div><aside className="operator-panel operator-locks"><span className="operator-kicker">Concurrency guard</span><h3>Production locks</h3>{Object.keys(locks).length ? Object.entries(locks).map(([name, state]) => <div key={name}><span><i className={`lock-${state}`} />{name.replaceAll("_", " ")}</span><strong>{state}</strong></div>) : <p>No lock registry is configured.</p>}</aside></section>
       <section className="operator-panel"><div className="operator-panel-head"><div><span>Audit trail</span><h3>Recent cockpit jobs</h3></div></div>{jobs.length ? <div className="operator-job-list">{jobs.map((job) => <article key={job.id}><span>{job.status ?? "unknown"}</span><div><strong>{job.label || job.command_id || job.id}</strong><p>{job.summary || job.error || "No summary recorded."}</p></div><small>{job.completed_at || job.started_at || job.created_at || "—"}</small></article>)}</div> : <p className="operator-empty-row">No cockpit action has run yet.</p>}</section>
-      <p className="operator-boundary-note">Nightly execution, LinkedIn/email sends, arbitrary shell commands, and final application submit are forbidden capabilities—not hidden buttons.</p>
+      <p className="operator-boundary-note">Consequential capabilities have visible review lanes but stay non-executable until their installed fixed-argument, reservation, archive, and reconciliation contracts are proven. Arbitrary shell access remains impossible.</p>
     </>
   );
 }

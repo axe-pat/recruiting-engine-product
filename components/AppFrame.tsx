@@ -16,7 +16,13 @@ import {
   type EngineMode,
   type OutreachItem,
 } from "@/lib/app-contract";
-import type { OperatorActionResult, OperatorOverview } from "@/lib/operator-contract";
+import type {
+  OperatorActionResult,
+  OperatorOverview,
+  OperatorReview,
+  OperatorReviewResult,
+  OperatorReviewTargetDetail,
+} from "@/lib/operator-contract";
 
 export type AppView =
   | "dashboard"
@@ -354,7 +360,22 @@ async function exchangePairingToken(config: CompanionConfig): Promise<CompanionC
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ pairing_token: config.token, client_type: "web" }),
   });
-  if (!response.ok) throw new Error("The one-time pairing token was rejected or already used.");
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const payload = (await response.json()) as { error?: { message?: unknown } };
+      if (typeof payload.error?.message === "string") detail = payload.error.message;
+    } catch {
+      // Keep the fallback concise; never echo an HTML body or submitted credential.
+    }
+    const safeDetail = detail
+      .replace(/re_(?:pair|web|local)_[A-Za-z0-9_-]+/g, "[credential redacted]")
+      .replace(/[\r\n\t]+/g, " ")
+      .slice(0, 180);
+    throw new Error(
+      `${safeDetail || "The one-time pairing token was rejected or already used."} Pairing tokens work once; generate a fresh token only after disconnecting this tab.`,
+    );
+  }
   const payload = (await response.json()) as { bearer_token?: string };
   if (!payload.bearer_token) throw new Error("The companion did not return a device token.");
   return { ...config, token: payload.bearer_token };
@@ -476,7 +497,7 @@ export function AppFrame({ view }: { view: AppView }) {
     }
     if (workspaceMode === "existing") {
       setRunning(true);
-      setNotice("Refreshing your local cockpit, exact run evidence, and capability guards. The signed scheduler remains the only full-nightly owner.");
+      setNotice("Refreshing your local cockpit, exact run evidence, and capability guards. Use the reviewed nightly lane to start one attested no-delivery cycle.");
       await loadDashboard(config);
       setRunning(false);
       return;
@@ -498,6 +519,11 @@ export function AppFrame({ view }: { view: AppView }) {
   };
 
   const saveConfig = async (nextConfig: CompanionConfig) => {
+    const sameAddress = nextConfig.baseUrl.trim().replace(/\/$/, "") === config.baseUrl.trim().replace(/\/$/, "");
+    if (connection === "connected" && sameAddress && config.token.startsWith("re_web_")) {
+      setNotice("Already connected. The pairing token was consumed once and this tab is using its short-lived private session; do not paste it again.");
+      return;
+    }
     let normalized = {
       baseUrl: nextConfig.baseUrl.trim().replace(/\/$/, ""),
       token: nextConfig.token.trim(),
@@ -577,6 +603,107 @@ export function AppFrame({ view }: { view: AppView }) {
     }
   };
 
+  const loadOperatorReviewTarget = async (
+    targetId: string,
+  ): Promise<OperatorReviewTargetDetail | null> => {
+    if (connection !== "connected" || workspaceMode !== "existing") return null;
+    try {
+      const result = await apiRequest<OperatorReviewResult>(
+        config,
+        `/api/v1/operator/review-targets/${encodeURIComponent(targetId)}/detail`,
+      );
+      return result.review_target ?? null;
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The exact review target is no longer available.");
+      return null;
+    }
+  };
+
+  const loadOperatorReview = async (
+    reviewId: string,
+  ): Promise<OperatorReviewResult | null> => {
+    if (connection !== "connected" || workspaceMode !== "existing") return null;
+    try {
+      return await apiRequest<OperatorReviewResult>(
+        config,
+        `/api/v1/operator/reviews/${encodeURIComponent(reviewId)}/detail`,
+      );
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The stored private review detail is no longer available.");
+      return null;
+    }
+  };
+
+  const createOperatorReview = async (
+    commandId: string,
+    targetId: string,
+    reviewedText: string,
+    reviewedSubject: string,
+  ): Promise<OperatorReview | null> => {
+    try {
+      const result = await apiRequest<OperatorReviewResult>(config, "/api/v1/operator/reviews", {
+        method: "POST",
+        body: JSON.stringify({
+          command_id: commandId,
+          target_id: targetId,
+          reviewed_text: reviewedText,
+          reviewed_subject: reviewedSubject,
+        }),
+      });
+      await loadDashboard(config);
+      return result.operator_review ?? null;
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The review could not be staged.");
+      return null;
+    }
+  };
+
+  const updateOperatorReviewContent = async (
+    reviewId: string,
+    reviewedText: string,
+    reviewedSubject: string,
+    confirmation: string,
+  ): Promise<OperatorReviewResult | null> => {
+    try {
+      const result = await apiRequest<OperatorReviewResult>(
+        config,
+        `/api/v1/operator/reviews/${encodeURIComponent(reviewId)}/content`,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            reviewed_text: reviewedText,
+            reviewed_subject: reviewedSubject,
+            confirmation,
+          }),
+        },
+      );
+      await loadDashboard(config);
+      return result;
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The exact review content could not be updated.");
+      return null;
+    }
+  };
+
+  const transitionOperatorReview = async (
+    reviewId: string,
+    transition: "review" | "approve" | "revoke",
+    confirmation: string,
+  ): Promise<OperatorReview | null> => {
+    try {
+      const result = await apiRequest<OperatorReviewResult>(
+        config,
+        `/api/v1/operator/reviews/${encodeURIComponent(reviewId)}/${transition}`,
+        { method: "POST", body: JSON.stringify({ confirmation }) },
+      );
+      await loadDashboard(config);
+      return result.operator_review ?? null;
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The review state did not change.");
+      return null;
+    }
+  };
+
   const importJobs = async (file: File, sourceLabel: string) => {
     if (connection !== "connected") {
       setNotice("Pair the local companion before importing a private source file.");
@@ -631,6 +758,13 @@ export function AppFrame({ view }: { view: AppView }) {
 
   const active = navItems.find((item) => item.id === view) ?? navItems[0];
   const mode: EngineMode = connection === "connected" ? "portable" : "preview";
+  const operatorReviewProps = {
+    onLoadReviewTarget: loadOperatorReviewTarget,
+    onLoadReview: loadOperatorReview,
+    onCreateReview: createOperatorReview,
+    onUpdateReviewContent: updateOperatorReviewContent,
+    onTransitionReview: transitionOperatorReview,
+  };
 
   return (
     <main className="operating-app">
@@ -717,16 +851,16 @@ export function AppFrame({ view }: { view: AppView }) {
         ) : null}
 
         <div className="app-content">
-          {view === "dashboard" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} /> : <Dashboard snapshot={snapshot} mode={mode} workspaceMode={workspaceMode} existingEngine={existingEngine} existingSnapshot={existingSnapshot} />) : null}
-          {view === "sources" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} /> : <SourcesView snapshot={snapshot} onImport={importJobs} />) : null}
-          {view === "queue" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} /> : <QueueView snapshot={snapshot} />) : null}
-          {view === "runs" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} /> : <RunsView snapshot={snapshot} />) : null}
-          {view === "applications" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} /> : <ApplicationsView snapshot={snapshot} />) : null}
+          {view === "dashboard" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <Dashboard snapshot={snapshot} mode={mode} workspaceMode={workspaceMode} existingEngine={existingEngine} existingSnapshot={existingSnapshot} />) : null}
+          {view === "sources" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <SourcesView snapshot={snapshot} onImport={importJobs} />) : null}
+          {view === "queue" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <QueueView snapshot={snapshot} />) : null}
+          {view === "runs" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <RunsView snapshot={snapshot} />) : null}
+          {view === "applications" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <ApplicationsView snapshot={snapshot} />) : null}
           {view === "outreach" ? (
-            workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} /> : <OutreachView snapshot={snapshot} onApprove={approveOutreach} />
+            workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <OutreachView snapshot={snapshot} onApprove={approveOutreach} />
           ) : null}
-          {view === "reports" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} /> : <ReportsView snapshot={snapshot} />) : null}
-          {view === "accounts" || view === "stories" || view === "operations" ? <OperatorWorkspace view={view} overview={workspaceMode === "existing" ? operatorOverview : null} connected={connection === "connected" && workspaceMode === "existing"} onAction={runOperatorAction} /> : null}
+          {view === "reports" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <ReportsView snapshot={snapshot} />) : null}
+          {view === "accounts" || view === "stories" || view === "operations" ? <OperatorWorkspace view={view} overview={workspaceMode === "existing" ? operatorOverview : null} connected={connection === "connected" && workspaceMode === "existing"} onAction={runOperatorAction} {...operatorReviewProps} /> : null}
           {view === "settings" ? (
             <SettingsView
               key={`${config.baseUrl}|${config.token}`}
@@ -1185,6 +1319,10 @@ function SettingsView({
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (connection === "connected") {
+      setFormError("This tab is already connected. The one-time token has been consumed; disconnect first only if you intend to create a new session.");
+      return;
+    }
     if (draft.baseUrl.replace(/\/$/, "") !== config.baseUrl.replace(/\/$/, "") && !draft.token) {
       setFormError("A changed companion address requires a new one-time pairing token.");
       return;
@@ -1200,14 +1338,21 @@ function SettingsView({
     <div className="settings-layout">
       <section className="app-panel settings-card">
         <PageLead eyebrow="Device pairing" title="Connect the private companion." body="The loopback address may persist; the hosted app keeps only a short-lived token in this tab session. Your documents and records stay in the local companion." />
-        <form onSubmit={submit}>
-          <label>Companion address<input type="url" value={draft.baseUrl} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} required /></label>
-          <label>Pairing token<input type="password" value={draft.token} onChange={(event) => setDraft({ ...draft, token: event.target.value })} placeholder={connection === "connected" ? "Short-lived web session active" : "Paste the one-time token"} required={connection !== "connected"} /></label>
-          <button className="run-button" type="submit" disabled={saving}>{saving ? "Checking…" : "Save and test"}</button>
-        </form>
+        {connection === "connected" ? (
+          <div className="pairing-connected-card" role="status">
+            <span className="connection-dot dot-connected" />
+            <div><strong>Connected in this tab</strong><p>The one-time pairing token was consumed successfully. This tab now uses a short-lived private session, so pasting the same token again will correctly be rejected.</p><small>{config.baseUrl}</small></div>
+          </div>
+        ) : (
+          <form onSubmit={submit}>
+            <label>Companion address<input type="url" value={draft.baseUrl} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} required /></label>
+            <label>One-time pairing token<input type="password" value={draft.token} onChange={(event) => setDraft({ ...draft, token: event.target.value })} placeholder="Paste a fresh re_pair_ token" required /></label>
+            <button className="run-button" type="submit" disabled={saving}>{saving ? "Checking…" : "Connect this tab"}</button>
+          </form>
+        )}
         {formError ? <p className="settings-form-error" role="alert">{formError}</p> : null}
         <p className="settings-status"><span className={`connection-dot dot-${connection}`} />{statusLabel(connection)}</p>
-        {connection === "connected" ? <button className="disconnect-button" type="button" onClick={onDisconnect}>Disconnect this tab</button> : null}
+        {connection === "connected" ? <button className="disconnect-button" type="button" onClick={onDisconnect}>Disconnect and pair again</button> : null}
       </section>
       <section className="app-panel settings-card">
         <PageLead eyebrow="Workspace mode" title="Portable or existing engine." body="New users start with a compact profile. Existing operators can bind the same UI to an installed Recruiting Engine checkout." />

@@ -18,6 +18,7 @@ ALLOWED_ENVIRONMENT = {
     "RECRUITING_ENGINE_MODE",
     "RECRUITING_ENGINE_ALLOW_REMOTE",
     "RECRUITING_ENGINE_ALLOW_LIVE_RUNS",
+    "RECRUITING_ENGINE_ALLOW_REVIEWED_ACTIONS",
     "RECRUITING_ENGINE_RESUME_ROOT",
     "RECRUITING_ENGINE_OUTREACH_ROOT",
     "RECRUITING_ENGINE_RUNTIME_DIR",
@@ -84,7 +85,9 @@ def validate_environment(environment: dict[str, str]) -> None:
     if environment.get("RECRUITING_ENGINE_ALLOW_REMOTE") != "0":
         raise ValueError("remote binding must remain disabled")
     if environment.get("RECRUITING_ENGINE_ALLOW_LIVE_RUNS") != "0":
-        raise ValueError("production execution must remain disabled")
+        raise ValueError("generic live-run mode must remain disabled")
+    if environment.get("RECRUITING_ENGINE_ALLOW_REVIEWED_ACTIONS") != "1":
+        raise ValueError("fixed reviewed actions must be explicitly enabled")
     if environment.get("RECRUITING_ENGINE_HOST") not in {
         "127.0.0.1",
         "localhost",

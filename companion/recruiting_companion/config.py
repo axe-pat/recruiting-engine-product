@@ -39,6 +39,7 @@ class Settings:
     resume_python: Path | None = None
     outreach_python: Path | None = None
     allow_live_runs: bool = False
+    allow_reviewed_actions: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -114,6 +115,9 @@ class Settings:
                 else None
             ),
             allow_live_runs=_env_bool("RECRUITING_ENGINE_ALLOW_LIVE_RUNS"),
+            allow_reviewed_actions=_env_bool(
+                "RECRUITING_ENGINE_ALLOW_REVIEWED_ACTIONS"
+            ),
         )
         settings.validate()
         return settings

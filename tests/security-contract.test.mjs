@@ -5,8 +5,15 @@ import test from "node:test";
 const appFrame = await readFile(new URL("../components/AppFrame.tsx", import.meta.url), "utf8");
 const onboarding = await readFile(new URL("../components/OnboardingWizard.tsx", import.meta.url), "utf8");
 const operatorWorkspace = await readFile(new URL("../components/OperatorWorkspace.tsx", import.meta.url), "utf8");
+const operatorContract = await readFile(new URL("../lib/operator-contract.ts", import.meta.url), "utf8");
 const operatorDocs = await readFile(new URL("../docs/OPERATOR_COCKPIT.md", import.meta.url), "utf8");
+const operatorBackend = await readFile(new URL("../companion/recruiting_companion/operator_backend.py", import.meta.url), "utf8");
+const companionDatabase = await readFile(new URL("../companion/recruiting_companion/db.py", import.meta.url), "utf8");
 const layout = await readFile(new URL("../app/layout.tsx", import.meta.url), "utf8");
+const operatorOverviewContract = operatorContract.slice(
+  operatorContract.indexOf("export type OperatorOverview"),
+  operatorContract.indexOf("export type OperatorActionResult"),
+);
 
 test("hosted pairing is explicit, short-lived, and tab-scoped", () => {
   assert.match(appFrame, /client_type:\s*"web"/);
@@ -15,6 +22,10 @@ test("hosted pairing is explicit, short-lived, and tab-scoped", () => {
   assert.match(onboarding, /sessionStorage\.setItem\(sessionConfigKey/);
   assert.doesNotMatch(appFrame, /localStorage\.setItem\([^\n]+JSON\.stringify\(normalized\)/);
   assert.doesNotMatch(onboarding, /localStorage\.setItem\([^\n]+JSON\.stringify\(pairedConfig\)/);
+  assert.match(appFrame, /Already connected\. The pairing token was consumed once/);
+  assert.match(appFrame, /Pairing tokens work once/);
+  assert.match(appFrame, /credential redacted/);
+  assert.match(appFrame, /Connected in this tab/);
 });
 
 test("preview does not probe loopback before user intent", () => {
@@ -44,6 +55,41 @@ test("operator controls call only the fixed local job registry", () => {
   assert.doesNotMatch(operatorWorkspace, /exec\(|spawn\(|child_process|command_line|argv/);
 });
 
+test("consequential actions use a dedicated exact-target review surface", () => {
+  assert.match(appFrame, /\/api\/v1\/operator\/review-targets\/\$\{encodeURIComponent\(targetId\)\}\/detail/);
+  assert.match(appFrame, /\/api\/v1\/operator\/reviews\/\$\{encodeURIComponent\(reviewId\)\}\/detail/);
+  assert.match(appFrame, /\/api\/v1\/operator\/reviews\/\$\{encodeURIComponent\(reviewId\)\}\/content/);
+  assert.match(appFrame, /\/api\/v1\/operator\/reviews/);
+  assert.match(appFrame, /method:\s*"PUT"/);
+  assert.match(appFrame, /reviewed_text:\s*reviewedText/);
+  assert.match(appFrame, /reviewed_subject:\s*reviewedSubject/);
+  assert.match(operatorWorkspace, /Exact recipient/);
+  assert.match(operatorWorkspace, /Exact recipient · immutable/);
+  assert.match(operatorWorkspace, /Exact LinkedIn body · editable/);
+  assert.match(operatorWorkspace, /Exact email subject · editable/);
+  assert.match(operatorWorkspace, /Exact email body · editable/);
+  assert.match(operatorWorkspace, /<textarea value=\{reviewedText\}/);
+  assert.match(operatorWorkspace, /type="text" value=\{reviewedSubject\}/);
+  assert.match(operatorWorkspace, /UPDATE_EXACT_REVIEW_CONTENT/);
+  assert.match(operatorWorkspace, /Update exact review content/);
+  assert.match(operatorWorkspace, /storedReview\.operator_review\.reviewed_text/);
+  assert.match(operatorWorkspace, /pending again and must be reviewed and approved/);
+  assert.match(operatorWorkspace, /APPROVE_EXACT_TARGET/);
+  assert.match(operatorWorkspace, /review_id: next\.id, target_id: next\.target_id/);
+  assert.match(operatorWorkspace, /prompt-only stopping is insufficient/);
+  assert.doesNotMatch(appFrame, /sessionStorage\.setItem\([^\n]+reviewed_(?:text|subject)/);
+  assert.match(operatorContract, /type OperatorReviewPrivateDetail[\s\S]*reviewed_subject[\s\S]*reviewed_text/);
+  assert.doesNotMatch(operatorOverviewContract, /reviewed_(?:text|subject)/);
+  assert.doesNotMatch(operatorWorkspace, /application\.submit/);
+  assert.match(operatorBackend, /_APPLY_ASSIST_BLOCKED_REASON/);
+  assert.match(operatorBackend, /def _execute_reviewed_apply_assist[\s\S]{0,700}result_code="application_assist_submit_guard_unavailable"[\s\S]{0,100}return/);
+  assert.ok(
+    [...operatorBackend.matchAll(/_run_reviewed_production_preflight\(/g)].length >= 5,
+    "every consequential executor must retain a last-moment production preflight",
+  );
+  assert.match(companionDatabase, /CREATE UNIQUE INDEX IF NOT EXISTS idx_operator_reviews_one_active[\s\S]{0,180}WHERE state IN \('pending', 'reviewed', 'approved'\)/);
+});
+
 test("existing mode chooses the minimized read model before the portable dashboard", () => {
   assert.match(appFrame, /\/api\/v1\/preferences/);
   assert.match(appFrame, /if \(nextMode === "existing"\) \{[\s\S]*\/api\/v1\/operator\/overview[\s\S]*\} else \{[\s\S]*\/api\/v1\/dashboard/);
@@ -63,5 +109,5 @@ test("operator surfaces preserve item guards and truthful aggregate semantics", 
   assert.match(operatorWorkspace, /function SourceRows/);
   assert.match(operatorWorkspace, /function ReportRows/);
   assert.match(operatorWorkspace, /Filename-classified, not canonical/);
-  assert.match(operatorWorkspace, /does not claim to be a draft queue/);
+  assert.match(operatorWorkspace, /aggregate projection is not a draft queue/);
 });

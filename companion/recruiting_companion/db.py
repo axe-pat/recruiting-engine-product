@@ -190,11 +190,61 @@ CREATE TABLE IF NOT EXISTS operator_jobs (
     stderr_sha256 TEXT NOT NULL DEFAULT '',
     stdout_lines INTEGER NOT NULL DEFAULT 0,
     stderr_lines INTEGER NOT NULL DEFAULT 0,
+    preflight_returncode INTEGER,
+    preflight_stdout_sha256 TEXT NOT NULL DEFAULT '',
+    preflight_stderr_sha256 TEXT NOT NULL DEFAULT '',
     result_code TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_operator_jobs_user
     ON operator_jobs(user_id, requested_at DESC);
+
+CREATE TABLE IF NOT EXISTS operator_reviews (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    command_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_label TEXT NOT NULL,
+    target_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    source_artifact_sha256 TEXT NOT NULL DEFAULT '',
+    artifact_sha256 TEXT NOT NULL,
+    reviewed_subject TEXT NOT NULL DEFAULT '',
+    reviewed_text TEXT NOT NULL DEFAULT '',
+    reviewed_subject_sha256 TEXT NOT NULL DEFAULT '',
+    reviewed_text_sha256 TEXT NOT NULL DEFAULT '',
+    execution_artifact_json TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    approved_at TEXT,
+    revoked_at TEXT,
+    consumed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_operator_reviews_user
+    ON operator_reviews(user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_operator_reviews_target
+    ON operator_reviews(user_id, command_id, target_id, state);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_operator_reviews_one_active
+    ON operator_reviews(user_id, command_id, target_id)
+    WHERE state IN ('pending', 'reviewed', 'approved');
+
+CREATE TABLE IF NOT EXISTS operator_review_events (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    review_id TEXT NOT NULL REFERENCES operator_reviews(id) ON DELETE CASCADE,
+    from_state TEXT NOT NULL,
+    to_state TEXT NOT NULL,
+    actor_scope TEXT NOT NULL,
+    confirmation_valid INTEGER NOT NULL DEFAULT 0
+        CHECK (confirmation_valid IN (0, 1)),
+    target_sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_operator_review_events_review
+    ON operator_review_events(review_id, created_at);
 """
 
 
@@ -225,6 +275,40 @@ class Database:
                     "ALTER TABLE operator_jobs ADD COLUMN "
                     "parameters_json TEXT NOT NULL DEFAULT '{}'"
                 )
+            for column, definition in (
+                ("preflight_returncode", "INTEGER"),
+                ("preflight_stdout_sha256", "TEXT NOT NULL DEFAULT ''"),
+                ("preflight_stderr_sha256", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if column not in operator_columns:
+                    connection.execute(
+                        f"ALTER TABLE operator_jobs ADD COLUMN {column} {definition}"
+                    )
+            review_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(operator_reviews)"
+                ).fetchall()
+            }
+            for column, definition in (
+                ("source_artifact_sha256", "TEXT NOT NULL DEFAULT ''"),
+                ("reviewed_subject", "TEXT NOT NULL DEFAULT ''"),
+                ("reviewed_text", "TEXT NOT NULL DEFAULT ''"),
+                ("reviewed_subject_sha256", "TEXT NOT NULL DEFAULT ''"),
+                ("reviewed_text_sha256", "TEXT NOT NULL DEFAULT ''"),
+                ("execution_artifact_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ):
+                if column not in review_columns:
+                    connection.execute(
+                        f"ALTER TABLE operator_reviews ADD COLUMN {column} {definition}"
+                    )
+            connection.execute(
+                """
+                UPDATE operator_reviews
+                SET source_artifact_sha256 = artifact_sha256
+                WHERE source_artifact_sha256 = ''
+                """
+            )
         try:
             self.path.chmod(0o600)
         except OSError:

@@ -139,10 +139,12 @@ operator_resolve_config() {
     ''|*[!A-Za-z0-9._-]*) operator_die "RECRUITING_ENGINE_OPERATOR_LAUNCH_LABEL contains unsupported characters"; return 1 ;;
   esac
 
-  # Operator mode is intentionally read-only with respect to production execution.
+  # Generic live-run mode stays off. Only fixed, hash-bound reviewed actions
+  # behind the local review ledger are enabled.
   RECRUITING_ENGINE_MODE="existing"
   RECRUITING_ENGINE_ALLOW_REMOTE="0"
   RECRUITING_ENGINE_ALLOW_LIVE_RUNS="0"
+  RECRUITING_ENGINE_ALLOW_REVIEWED_ACTIONS="1"
   PYTHONPATH="${OPERATOR_PRODUCT_ROOT}/companion"
   PYTHONUNBUFFERED="1"
 
@@ -152,6 +154,7 @@ operator_resolve_config() {
     RECRUITING_ENGINE_MODE \
     RECRUITING_ENGINE_ALLOW_REMOTE \
     RECRUITING_ENGINE_ALLOW_LIVE_RUNS \
+    RECRUITING_ENGINE_ALLOW_REVIEWED_ACTIONS \
     RECRUITING_ENGINE_RESUME_ROOT \
     RECRUITING_ENGINE_OUTREACH_ROOT \
     RECRUITING_ENGINE_RUNTIME_DIR \
@@ -172,7 +175,7 @@ operator_resolve_config() {
 
 operator_print_config() {
   printf '%s\n' \
-    "Mode: existing (production execution disabled)" \
+    "Mode: existing (fixed reviewed actions enabled; generic live-run disabled)" \
     "Bind: ${RECRUITING_ENGINE_HOST}:${RECRUITING_ENGINE_PORT}" \
     "Product root: ${OPERATOR_PRODUCT_ROOT}" \
     "Resume engine: ${RECRUITING_ENGINE_RESUME_ROOT}" \

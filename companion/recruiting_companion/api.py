@@ -49,7 +49,7 @@ class CompanionHTTPServer(ThreadingHTTPServer):
 
 class CompanionHandler(BaseHTTPRequestHandler):
     server: CompanionHTTPServer
-    server_version = "RecruitingEngineCompanion/0.1"
+    server_version = "RecruitingEngineCompanion/0.2"
     sys_version = ""
 
     def do_OPTIONS(self) -> None:  # noqa: N802
@@ -293,6 +293,134 @@ class CompanionHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     HTTPStatus.OK,
                     {"assets": operator.assets()},
+                    origin,
+                )
+                return
+            if method == "GET" and route == "/operator/review-targets":
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"review_targets": operator.review_targets()},
+                    origin,
+                )
+                return
+            review_target_match = re.fullmatch(
+                r"/operator/review-targets/([^/]+)/detail", route
+            )
+            if method == "GET" and review_target_match:
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "review_target": operator.get_review_target_detail(
+                            review_target_match.group(1)
+                        )
+                    },
+                    origin,
+                )
+                return
+            if route == "/operator/reviews":
+                if method == "GET":
+                    items = operator.list_reviews(**self._pagination(query))
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {"items": items, "count": len(items)},
+                        origin,
+                    )
+                    return
+                if method == "POST":
+                    body = self._json_body()
+                    unknown = set(body) - {
+                        "command_id",
+                        "target_id",
+                        "reviewed_subject",
+                        "reviewed_text",
+                    }
+                    if unknown:
+                        raise ValidationError(
+                            "unsupported operator review fields: "
+                            + ", ".join(sorted(unknown))
+                        )
+                    review = operator.create_review(
+                        command_id=str(body.get("command_id") or ""),
+                        target_id=str(body.get("target_id") or ""),
+                        requested_scope=getattr(self, "_auth_scope", "local"),
+                        reviewed_subject=body.get("reviewed_subject"),
+                        reviewed_text=body.get("reviewed_text"),
+                    )
+                    self._send_json(
+                        HTTPStatus.CREATED,
+                        {"operator_review": review},
+                        origin,
+                    )
+                    return
+            review_detail_match = re.fullmatch(
+                r"/operator/reviews/([^/]+)/detail", route
+            )
+            if method == "GET" and review_detail_match:
+                review, target = operator.get_review_detail(
+                    review_detail_match.group(1)
+                )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"operator_review": review, "review_target": target},
+                    origin,
+                )
+                return
+            review_content_match = re.fullmatch(
+                r"/operator/reviews/([^/]+)/content", route
+            )
+            if method == "PUT" and review_content_match:
+                body = self._json_body()
+                unknown = set(body) - {
+                    "reviewed_subject",
+                    "reviewed_text",
+                    "confirmation",
+                }
+                if unknown:
+                    raise ValidationError(
+                        "unsupported operator review content fields: "
+                        + ", ".join(sorted(unknown))
+                    )
+                review, target = operator.update_review_content(
+                    review_content_match.group(1),
+                    reviewed_subject=body.get("reviewed_subject"),
+                    reviewed_text=body.get("reviewed_text"),
+                    confirmation=str(body.get("confirmation") or ""),
+                    requested_scope=getattr(self, "_auth_scope", "local"),
+                )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"operator_review": review, "review_target": target},
+                    origin,
+                )
+                return
+            review_match = re.fullmatch(r"/operator/reviews/([^/]+)", route)
+            if method == "GET" and review_match:
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"operator_review": operator.get_review(review_match.group(1))},
+                    origin,
+                )
+                return
+            review_transition_match = re.fullmatch(
+                r"/operator/reviews/([^/]+)/(review|approve|revoke)", route
+            )
+            if method == "POST" and review_transition_match:
+                body = self._json_body()
+                unknown = set(body) - {"confirmation"}
+                if unknown:
+                    raise ValidationError(
+                        "unsupported operator review transition fields: "
+                        + ", ".join(sorted(unknown))
+                    )
+                review = operator.transition_review(
+                    review_transition_match.group(1),
+                    transition=review_transition_match.group(2),
+                    confirmation=str(body.get("confirmation") or ""),
+                    requested_scope=getattr(self, "_auth_scope", "local"),
+                )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"operator_review": review},
                     origin,
                 )
                 return
@@ -577,6 +705,9 @@ class CompanionHandler(BaseHTTPRequestHandler):
             ("GET", "/operator/overview"),
             ("GET", "/operator/capabilities"),
             ("GET", "/operator/assets"),
+            ("GET", "/operator/review-targets"),
+            ("GET", "/operator/reviews"),
+            ("POST", "/operator/reviews"),
             ("GET", "/operator/jobs"),
             ("POST", "/operator/jobs"),
         }
@@ -586,6 +717,24 @@ class CompanionHandler(BaseHTTPRequestHandler):
         if method == "POST" and re.fullmatch(r"/outreach/[^/]+/approve", route):
             allowed = True
         if method == "GET" and re.fullmatch(r"/operator/jobs/[^/]+", route):
+            allowed = True
+        if method == "GET" and re.fullmatch(
+            r"/operator/review-targets/[^/]+/detail", route
+        ):
+            allowed = True
+        if method == "GET" and re.fullmatch(r"/operator/reviews/[^/]+", route):
+            allowed = True
+        if method == "GET" and re.fullmatch(
+            r"/operator/reviews/[^/]+/detail", route
+        ):
+            allowed = True
+        if method == "PUT" and re.fullmatch(
+            r"/operator/reviews/[^/]+/content", route
+        ):
+            allowed = True
+        if method == "POST" and re.fullmatch(
+            r"/operator/reviews/[^/]+/(review|approve|revoke)", route
+        ):
             allowed = True
         if allowed:
             return True

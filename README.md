@@ -1,5 +1,7 @@
 # Recruiting Engine — portable product surface
 
+**Live product:** [https://axe-pat.github.io/](https://axe-pat.github.io/)
+
 Recruiting Engine is a portfolio-grade, hosted interface for a real personal AI
 product built across two operating repositories:
 
@@ -61,6 +63,9 @@ npm test
 The site uses the bundled vinext/Cloudflare Workers-compatible build and stores
 no runtime secrets or database state.
 
+For the exact validation and GitHub Pages publishing sequence, see
+[deployment notes](docs/DEPLOYMENT.md).
+
 ## Portfolio positioning
 
 This is a real single-user vertical AI product and a portable read-only showcase.
@@ -69,4 +74,3 @@ autonomous job-application agent. Its proof is the operating depth underneath th
 interface: durable state, source adapters, decision queues, production scheduling,
 execution controls, exact artifacts, outcome telemetry, and product changes driven
 by real use.
-

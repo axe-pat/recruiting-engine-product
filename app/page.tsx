@@ -106,11 +106,14 @@ export default function Home() {
             engineering team.
           </p>
           <div className="hero-actions">
-            <a className="button-primary" href="#proof">
-              Explore the product <span aria-hidden="true">↓</span>
+            <a className="button-primary" href="/app">
+              Open the working product <span aria-hidden="true">→</span>
             </a>
             <a className="button-secondary" href="/story">
               Read the build story <span aria-hidden="true">→</span>
+            </a>
+            <a className="button-secondary" href="/app/onboarding">
+              Create a workspace <span aria-hidden="true">↗</span>
             </a>
           </div>
           <div className="hero-meta" aria-label="Build facts">

@@ -64,3 +64,47 @@ test("server-renders architecture, source state, and guardrails", async () => {
   assert.match(html, /Product Strategy/);
 });
 
+test("server-renders the working command center and all human gates", async () => {
+  const response = await render("/app");
+  assert.equal(response.status, 200);
+
+  const html = await response.text();
+  assert.match(html, /Command center/);
+  assert.match(html, /Fictional preview data/);
+  assert.match(html, /Preview run state/);
+  assert.match(html, /Pair the local companion/);
+  assert.doesNotMatch(html, /auto-send/i);
+});
+
+test("server-renders private first-run onboarding", async () => {
+  const response = await render("/app/onboarding");
+  assert.equal(response.status, 200);
+
+  const html = await response.text();
+  assert.match(html, /First-run setup/);
+  assert.match(html, /One baseline resume/i);
+  assert.match(html, /not uploaded to the hosting server/i);
+  assert.match(html, /Private pairing/);
+});
+
+test("server-renders truthful source setup and imports", async () => {
+  const response = await render("/app/sources");
+  assert.equal(response.status, 200);
+
+  const html = await response.text();
+  assert.match(html, /Source control/);
+  assert.match(html, /Handshake/);
+  assert.match(html, /JobSpy/);
+  assert.match(html, /public extension does not scrape or automate LinkedIn/i);
+});
+
+test("server-renders the local-first privacy contract", async () => {
+  const response = await render("/privacy");
+  assert.equal(response.status, 200);
+
+  const html = await response.text();
+  assert.match(html, /Your search is personal/);
+  assert.match(html, /local system of record/);
+  assert.match(html, /does not collect browsing history/);
+  assert.match(html, /does not sell user data/);
+});

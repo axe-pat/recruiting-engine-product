@@ -1,5 +1,3 @@
-/* eslint-disable @next/next/no-html-link-for-pages -- static export needs full-page navigation */
-
 import type { Metadata } from "next";
 
 import { SiteFooter } from "@/components/SiteFooter";
@@ -47,6 +45,13 @@ const chapters = [
     body:
       "A canary fallback once associated a person with the wrong company and sent one connection invite. I stopped the remaining batch, withdrew the invite, confirmed that no message had been sent, and converted the incident into a fail-closed rule across every send surface: coverage-only candidates cannot execute without independent current-employer evidence. The incident is part of the proof, not something hidden from the story.",
     quote: "The product matured when a real failure became a permanent regression test.",
+  },
+  {
+    label: "06 · The portable release",
+    title: "The proof surface became a product another person can actually enter.",
+    body:
+      "The next product question was portability. A new user cannot bring months of accumulated resumes, profile framings, source state, and relationship history on day one. The release now starts from one baseline resume, a compact target frame, and reviewed imports. A hosted command center pairs with a private local companion and a narrow Chrome side panel, so onboarding, decisions, reports, and outreach review work without turning personal recruiting data into a hosted database.",
+    quote: "Make the accumulated intelligence portable without pretending every new user starts with the same history.",
   },
 ] as const;
 
@@ -136,11 +141,14 @@ export default function StoryPage() {
           </article>
         </div>
         <div className="hero-actions">
-          <a className="button-primary" href="/architecture">
-            Inspect the architecture <span aria-hidden="true">→</span>
+          <a className="button-primary" href="/app">
+            Open the working product <span aria-hidden="true">→</span>
           </a>
-          <a className="button-secondary" href="/">
-            Return to the product <span aria-hidden="true">↗</span>
+          <a className="button-secondary" href="/app/onboarding">
+            Create a private workspace <span aria-hidden="true">↗</span>
+          </a>
+          <a className="button-secondary" href="/architecture">
+            Inspect the architecture <span aria-hidden="true">↗</span>
           </a>
         </div>
       </section>

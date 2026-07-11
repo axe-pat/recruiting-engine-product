@@ -2,6 +2,7 @@
 
 const links = [
   { href: "/#product", label: "Product" },
+  { href: "/app", label: "Open app" },
   { href: "/story", label: "Story" },
   { href: "/architecture", label: "Architecture" },
 ] as const;
@@ -25,13 +26,8 @@ export function SiteNav() {
           </a>
         ))}
       </nav>
-      <a
-        className="nav-code-link"
-        href="https://github.com/axe-pat"
-        target="_blank"
-        rel="noreferrer"
-      >
-        View code <span aria-hidden="true">↗</span>
+      <a className="nav-code-link" href="/app/onboarding">
+        Create workspace <span aria-hidden="true">→</span>
       </a>
     </header>
   );

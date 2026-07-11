@@ -1,76 +1,170 @@
-# Recruiting Engine — portable product surface
+# Recruiting Engine
 
-**Live product:** [https://axe-pat.github.io/](https://axe-pat.github.io/)
+**Live product:** [axe-pat.github.io](https://axe-pat.github.io/)
 
-Recruiting Engine is a portfolio-grade, hosted interface for a real personal AI
-product built across two operating repositories:
+**Working app:** [axe-pat.github.io/app](https://axe-pat.github.io/app/)
+
+**Product story:** [axe-pat.github.io/story](https://axe-pat.github.io/story/)
+
+Recruiting Engine is a local-first recruiting decision system built from a real,
+months-long operating workflow. It turns role, company, and relationship evidence
+into one reviewed queue: apply, reach out, follow up, research, watch, or skip.
+
+The product now has three cooperating surfaces:
+
+| Surface | Responsibility | Data boundary |
+|---|---|---|
+| Hosted command center | Onboarding, dashboards, sources, queues, runs, applications, outreach review, and reports | Static preview until paired |
+| Local companion | SQLite system of record, document storage, pairing, imports, deterministic portable runs, review state, and existing-engine evidence | User device only |
+| Chrome companion | Explicit page/paste intake and recipient-plus-draft approval | Device-local; no send action |
+
+The original operating depth remains in two source engines:
 
 - [ResumeGenerator](https://github.com/axe-pat/Resume-generator) — discovery,
-  fit decisions, application state, and tailored application materials.
+  eligibility and fit decisions, application state, and tailored materials.
 - [Outreach](https://github.com/axe-pat/Outreach) — company and people state,
-  relationship workflows, bounded execution, reconciliation, and outcome learning.
+  relationship workflows, bounded execution, reconciliation, and learning.
 
-The original product is private and operator-specific. This repository is the
-portable proof surface: it explains the system, demonstrates its decision model,
-and publishes reviewed aggregate evidence without exposing resumes, contacts,
-messages, credentials, or real targeting data.
+## Product architecture
+
+```text
+Hosted command center (public code, fictional preview)
+                │
+                │ one-time loopback pairing
+                ▼
+Local companion (SQLite + private document directory)
+       │                         │
+       │ portable mode           │ read-only existing adapter
+       ▼                         ▼
+Reviewed imports          ResumeGenerator + Outreach
+deterministic queue        exact summary → manifest → report evidence
+       ▲
+       │ explicit intake and approval
+Chrome MV3 side panel
+```
+
+The website never becomes the database. It persists only a loopback origin; a
+30-minute web token lives in tab-scoped session storage. Private documents and
+operational records go directly to the companion running on that device.
 
 ## Product routes
 
-- `/` — interactive product demo, verified proof metrics, evolution, and public
-  source-repository links.
-- `/story` — fact-checked PM/first-user case study, including the failure that
-  became a permanent product guardrail.
-- `/architecture` — source, decision, execution, role-coverage, source-health,
-  and safety architecture.
+- `/app` — command center with source health, priorities, applications, and conversations;
+- `/app/onboarding` — four-step private onboarding with curated uploads;
+- `/app/sources` — Handshake/generic CSV import and explicit connector states;
+- `/app/queue` — one human-gated daily decision queue;
+- `/app/runs` and `/app/reports` — run-scoped evidence and decision briefs;
+- `/app/applications` and `/app/outreach` — execution state and full-draft approval;
+- `/app/settings` — pairing, portable/existing mode, and engine-binding status;
+- `/story`, `/architecture`, and `/privacy` — product narrative, system design, and data policy.
 
-## Evidence and privacy
+Every unpaired route uses explicitly fictional records. Pairing replaces the
+preview with the user's local data; it never mixes the two.
 
-`lib/product-data.ts` is the only public product snapshot. It contains:
+## Start the working product locally
 
-- reviewed, non-identifying aggregate metrics;
-- system stages, policies, and safety controls;
-- role-family and source-health totals;
-- clearly labeled fictional demo queue records.
+Requirements: Node.js `>=22.13.0` for the hosted UI and Python `>=3.11` for the
+dependency-free companion.
 
-It intentionally contains no personal names, emails, profile URLs, private
-message text, resumes, application materials, credentials, browser state, or raw
-production artifacts. See [data portability](product-notes/data-portability.md)
-for the full boundary and refresh procedure.
-
-## Product story
-
-The defensible narrative, source ledger, resume bullets, and interview-ready
-version live in [the narrative brief](product-notes/narrative-brief.md). The short
-version:
-
-> I acted as the product manager, first user, and operator, and used AI coding
-> agents as my engineering team. Across 96 versioned days and 151 commits, I
-> turned a resume-tailoring workflow into a production recruiting decision system
-> with two specialized execution lanes, a scheduled nightly path, exact-run
-> evidence, human gates, and 542 attested release tests.
-
-## Local development
-
-Requirements: Node.js `>=22.13.0`.
+Start the command center:
 
 ```bash
 npm install
 npm run dev
-npm test
 ```
 
-The site uses the bundled vinext/Cloudflare Workers-compatible build and stores
-no runtime secrets or database state.
+In another terminal, from this repository root:
 
-For the exact validation and GitHub Pages publishing sequence, see
-[deployment notes](docs/DEPLOYMENT.md).
+```bash
+export PYTHONPATH="$PWD/companion"
+python3 -m recruiting_companion serve
+```
 
-## Portfolio positioning
+The companion binds to `127.0.0.1:8765`, creates a private per-user data
+directory, and prints the path to a one-time pairing token. Open
+`http://localhost:3000/app/onboarding`, paste that token in the final step, and
+the browser exchanges it for a local bearer.
 
-This is a real single-user vertical AI product and a portable read-only showcase.
-It is not presented as a multi-tenant SaaS, a monetized service, or a fully
-autonomous job-application agent. Its proof is the operating depth underneath the
-interface: durable state, source adapters, decision queues, production scheduling,
-execution controls, exact artifacts, outcome telemetry, and product changes driven
-by real use.
+See [the companion guide](companion/README.md) for the API, custom data roots,
+token rotation, source import schema, and security model.
+
+## Bind an existing engine
+
+Portable mode starts empty and makes only claims it can prove from the user's
+local imports. Existing-engine mode is a read-only evidence adapter over a
+separately installed ResumeGenerator + Outreach system:
+
+```bash
+export RECRUITING_ENGINE_RESUME_ROOT="/path/to/resume-engine"
+export RECRUITING_ENGINE_OUTREACH_ROOT="/path/to/outreach-engine"
+export RECRUITING_ENGINE_RUNTIME_DIR="/path/to/runtime-lock-directory"
+export RECRUITING_ENGINE_ATTESTATION_PATH="/path/to/release-attestation.json"
+python3 -m recruiting_companion serve
+```
+
+The adapter follows exact run pointers and refuses mutable `latest`/`current`
+aliases. It never invokes the live pipeline. The installed scheduler remains the
+only production-run owner; the app refreshes verified evidence. See
+[the adapter contract](docs/EXISTING_ENGINE_ADAPTER.md) and
+[run-evidence contract](docs/RUN_EVIDENCE_CONTRACT.md).
+
+## Install the Chrome companion
+
+For local development:
+
+1. Start and pair the local companion.
+2. Open `chrome://extensions`, enable Developer mode, and choose **Load unpacked**.
+3. Select this repository's `extension/` directory.
+4. Open the toolbar action, grant access to the selected loopback origin, and pair.
+
+The extension requests `activeTab`, `scripting`, `sidePanel`, `storage`, and an
+optional loopback host grant. It has no persistent content script, broad internet
+host access, message-send action, or LinkedIn capture. Full details are in
+[the extension guide](extension/README.md) and
+[store-review notes](extension/STORE_REVIEW.md).
+
+## Verification
+
+Hosted app:
+
+```bash
+npm run verify:privacy
+npm run lint
+npx tsc --noEmit
+npm test
+npm audit --omit=dev
+```
+
+Local companion:
+
+```bash
+PYTHONPATH=companion python3 -m unittest discover -s companion/tests -v
+python3 -m compileall -q companion/recruiting_companion companion/tests
+```
+
+Chrome extension:
+
+```bash
+node --test extension/tests/*.test.mjs
+node --check extension/service-worker.js
+node --check extension/sidepanel.js
+python3 -m json.tool extension/manifest.json >/dev/null
+```
+
+## Privacy and product claims
+
+The public bundle contains reviewed non-identifying aggregates and fictional
+examples. It contains no resumes, contacts, messages, credentials, signed-in
+browser state, or production artifacts. The paired app talks directly to the
+loopback companion; there is no hosted user database in this release.
+
+This repository supports two truthful claims:
+
+1. the underlying single-user system has real production operating depth,
+   scheduled runs, exact evidence, and human-gated execution;
+2. the portable release is a real local-first product for onboarding, imports,
+   state, decisions, reports, browser intake, and reviewed outreach—not a claim
+   of feature parity with the private operator's accumulated data or sources.
+
+See the [hosted privacy policy](https://axe-pat.github.io/privacy/) and
+[data-portability boundary](product-notes/data-portability.md).

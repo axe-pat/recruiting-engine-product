@@ -6,6 +6,17 @@ const routes = [
   { path: "/", output: "index.html" },
   { path: "/story", output: "story/index.html" },
   { path: "/architecture", output: "architecture/index.html" },
+  { path: "/privacy", output: "privacy/index.html" },
+  { path: "/install", output: "install/index.html" },
+  { path: "/app", output: "app/index.html" },
+  { path: "/app/onboarding", output: "app/onboarding/index.html" },
+  { path: "/app/sources", output: "app/sources/index.html" },
+  { path: "/app/queue", output: "app/queue/index.html" },
+  { path: "/app/runs", output: "app/runs/index.html" },
+  { path: "/app/applications", output: "app/applications/index.html" },
+  { path: "/app/outreach", output: "app/outreach/index.html" },
+  { path: "/app/reports", output: "app/reports/index.html" },
+  { path: "/app/settings", output: "app/settings/index.html" },
 ];
 
 const workerUrl = new URL("../dist/server/index.js", import.meta.url);

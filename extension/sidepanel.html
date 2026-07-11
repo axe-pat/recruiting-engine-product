@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Recruiting Engine Companion</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand" aria-label="Recruiting Engine Companion">
+          <span class="brand-mark" aria-hidden="true">RE</span>
+          <span class="brand-copy">
+            <strong>Recruiting Engine</strong>
+            <small>Local companion</small>
+          </span>
+        </div>
+        <button class="connection-pill" id="connectionButton" type="button" aria-controls="settingsPanel">
+          <i aria-hidden="true"></i>
+          <span id="connectionLabel">Not paired</span>
+        </button>
+      </header>
+
+      <main>
+        <section class="intro" aria-labelledby="introTitle">
+          <p class="eyebrow"><i aria-hidden="true"></i> Human-gated intake</p>
+          <h1 id="introTitle">Bring context in.<br /><em>Keep control.</em></h1>
+          <p>
+            Capture only what you choose, hand it to your local engine, then confirm the recipient
+            and draft before anything can be approved.
+          </p>
+          <ol class="step-track" aria-label="Companion workflow">
+            <li class="active" data-step="1"><span>01</span> Context</li>
+            <li data-step="2"><span>02</span> Review</li>
+            <li data-step="3"><span>03</span> Approve</li>
+          </ol>
+        </section>
+
+        <section class="pair-banner" id="pairBanner" aria-labelledby="pairTitle">
+          <div>
+            <span class="micro-label">One-time setup</span>
+            <h2 id="pairTitle">Pair your local engine</h2>
+            <p>Your token stays in Chrome's local extension storage and is never added to a page.</p>
+          </div>
+          <button class="text-button" id="openSettingsButton" type="button">
+            Pair now <span aria-hidden="true">→</span>
+          </button>
+        </section>
+
+        <section class="panel-card intake-card" aria-labelledby="contextTitle">
+          <div class="card-heading">
+            <div>
+              <span class="section-index">01 / Context</span>
+              <h2 id="contextTitle">Choose the evidence</h2>
+            </div>
+            <span class="privacy-chip">Explicit only</span>
+          </div>
+
+          <button class="capture-button" id="captureButton" type="button">
+            <span class="button-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" role="img">
+                <path d="M8 3H5a2 2 0 0 0-2 2v3m13-5h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3m13 5h3a2 2 0 0 0 2-2v-3M7 12h10" />
+              </svg>
+            </span>
+            <span>
+              <strong>Capture selected text + page</strong>
+              <small>Current tab only · blocked on LinkedIn</small>
+            </span>
+            <span aria-hidden="true">↗</span>
+          </button>
+
+          <article class="source-preview" id="sourcePreview" hidden aria-live="polite">
+            <div class="source-topline">
+              <span class="source-favicon" aria-hidden="true">↗</span>
+              <div>
+                <strong id="sourceTitle"></strong>
+                <small id="sourceHost"></small>
+              </div>
+              <button class="icon-button" id="clearSourceButton" type="button" aria-label="Remove captured page">
+                ×
+              </button>
+            </div>
+            <blockquote id="sourceSelection"></blockquote>
+            <p class="source-empty" id="sourceEmpty">No text was selected; page metadata will be used.</p>
+          </article>
+
+          <div class="or-rule"><span>or paste what you are allowed to use</span></div>
+
+          <label class="field-label" for="kindInput">Intake type</label>
+          <div class="select-wrap">
+            <select id="kindInput">
+              <option value="job">Job or role</option>
+              <option value="company">Company signal</option>
+              <option value="contact">Relationship context</option>
+              <option value="note">General note</option>
+            </select>
+            <span aria-hidden="true">↓</span>
+          </div>
+
+          <label class="field-label" for="titleInput">
+            Intake title <span>Required for jobs</span>
+          </label>
+          <input
+            id="titleInput"
+            maxlength="1000"
+            type="text"
+            placeholder="Role, company, person, or note title"
+          />
+
+          <label class="field-label" for="pasteInput">
+            Pasted context
+            <span id="pasteCounter">0 / 20,000</span>
+          </label>
+          <textarea
+            id="pasteInput"
+            maxlength="20000"
+            rows="6"
+            placeholder="Paste a job description, company note, or other context…"
+          ></textarea>
+          <p class="field-help">Clipboard access is not requested. Paste here directly with ⌘V or Ctrl+V.</p>
+
+          <label class="field-label note-label" for="noteInput">
+            Direction for the engine <span>Optional</span>
+          </label>
+          <input
+            id="noteInput"
+            maxlength="2000"
+            type="text"
+            placeholder="e.g. Assess fit and prepare a concise relationship note"
+          />
+
+          <button class="primary-button" id="createIntakeButton" type="button" disabled>
+            Create review packet <span aria-hidden="true">→</span>
+          </button>
+          <p class="action-note" id="intakeActionNote">Pair the local companion to continue.</p>
+        </section>
+
+        <section class="review-loader" id="reviewLoader" aria-labelledby="reviewLoaderTitle">
+          <div>
+            <span class="section-index">02 / Review</span>
+            <h2 id="reviewLoaderTitle">Pull the next prepared draft</h2>
+            <p>
+              Loads a full local draft only when its recipient record can be resolved. New intake
+              context stays separate until your engine prepares outreach from it.
+            </p>
+          </div>
+          <button id="loadDraftButton" type="button" disabled>
+            Load review <span aria-hidden="true">→</span>
+          </button>
+        </section>
+
+        <section class="panel-card review-card" id="reviewCard" hidden aria-labelledby="reviewTitle">
+          <div class="card-heading">
+            <div>
+              <span class="section-index">02 / Review</span>
+              <h2 id="reviewTitle">Verify before approval</h2>
+            </div>
+            <span class="status-chip" id="reviewStatus">Draft</span>
+          </div>
+
+          <div class="run-reference" id="runReference" hidden>
+            <span>Local outreach record</span>
+            <button id="openRunButton" type="button"></button>
+          </div>
+
+          <article class="review-section recipient-section">
+            <div class="review-section-title">
+              <span class="review-number">A</span>
+              <div>
+                <span class="micro-label">Recipient</span>
+                <h3 id="recipientName">Recipient pending</h3>
+              </div>
+            </div>
+            <dl class="recipient-grid">
+              <div>
+                <dt>Role</dt>
+                <dd id="recipientRole">—</dd>
+              </div>
+              <div>
+                <dt>Company</dt>
+                <dd id="recipientCompany">—</dd>
+              </div>
+              <div>
+                <dt>Channel</dt>
+                <dd id="recipientChannel">—</dd>
+              </div>
+            </dl>
+            <p class="destination" id="recipientDestination" hidden></p>
+            <label class="confirm-row" for="recipientConfirmed">
+              <input id="recipientConfirmed" type="checkbox" />
+              <span class="checkmark" aria-hidden="true"></span>
+              <span>
+                <strong>I verified the recipient</strong>
+                <small>The intended person, company, and channel are correct.</small>
+              </span>
+            </label>
+          </article>
+
+          <article class="review-section draft-section">
+            <div class="review-section-title">
+              <span class="review-number">B</span>
+              <div>
+                <span class="micro-label">Draft</span>
+                <h3 id="draftSubject">Message review</h3>
+              </div>
+            </div>
+            <div class="draft-copy" id="draftBody"></div>
+            <label class="confirm-row" for="draftReviewed">
+              <input id="draftReviewed" type="checkbox" />
+              <span class="checkmark" aria-hidden="true"></span>
+              <span>
+                <strong>I reviewed the complete draft</strong>
+                <small>Open Outreach if the copy needs editing before approval.</small>
+              </span>
+            </label>
+          </article>
+
+          <button class="approve-button" id="approveButton" type="button" disabled>
+            <span aria-hidden="true">✓</span> Approve for the reviewed queue
+          </button>
+          <p class="no-send-note"><strong>This does not send a message.</strong> It only marks the reviewed item approved in your local engine.</p>
+        </section>
+
+        <section class="quick-links" aria-label="Hosted product links">
+          <div class="quick-links-heading">
+            <span class="section-index">Product surface</span>
+            <span id="linkState">Hosted HTTPS</span>
+          </div>
+          <div class="link-grid">
+            <button type="button" data-app-path="/app" disabled>
+              <span aria-hidden="true">⌂</span><strong>Dashboard</strong><small>Decision surface</small>
+            </button>
+            <button type="button" data-app-path="/app/runs" disabled>
+              <span aria-hidden="true">◫</span><strong>Runs</strong><small>Exact evidence</small>
+            </button>
+            <button type="button" data-app-path="/app/outreach" disabled>
+              <span aria-hidden="true">↗</span><strong>Outreach</strong><small>Reviewed queue</small>
+            </button>
+          </div>
+        </section>
+
+        <details class="settings-panel" id="settingsPanel">
+          <summary>
+            <span>
+              <span class="section-index">Settings</span>
+              <strong>Local companion pairing</strong>
+            </span>
+            <span class="summary-arrow" aria-hidden="true">↓</span>
+          </summary>
+          <div class="settings-body">
+            <label class="field-label" for="baseUrlInput">Companion base URL</label>
+            <input id="baseUrlInput" type="url" value="http://127.0.0.1:8765" spellcheck="false" />
+            <p class="field-help">Only localhost and 127.0.0.1 are accepted. Host access is requested when you pair.</p>
+
+            <label class="field-label" for="tokenInput">
+              Pairing or bearer token <span id="tokenState">Required</span>
+            </label>
+            <div class="token-field">
+              <input id="tokenInput" type="password" autocomplete="off" placeholder="Paste re_pair_… or re_local_… token" />
+              <button id="toggleTokenButton" type="button" aria-label="Show pairing token">Show</button>
+            </div>
+            <p class="field-help">A one-time <code>re_pair_</code> token is exchanged for a bearer. The saved bearer is never rendered again.</p>
+
+            <div class="settings-actions">
+              <button class="primary-button compact" id="pairButton" type="button">Pair + verify</button>
+              <button class="danger-button" id="disconnectButton" type="button" hidden>Disconnect</button>
+            </div>
+            <p class="settings-status" id="settingsStatus" role="status"></p>
+          </div>
+        </details>
+      </main>
+
+      <footer>
+        <span><i aria-hidden="true"></i> Local by design</span>
+        <span>No telemetry · No auto-send</span>
+      </footer>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>

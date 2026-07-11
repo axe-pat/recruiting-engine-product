@@ -42,3 +42,11 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# Python local companion
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# release packages
+/release/

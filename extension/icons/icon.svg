@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Recruiting Engine Companion</title>
+  <desc id="desc">A lime circular badge with a dark R-shaped decision path and coral endpoint.</desc>
+  <circle cx="64" cy="64" r="58" fill="#11130f" />
+  <circle cx="64" cy="64" r="54" fill="#d8ff5f" />
+  <path d="M45 91V37h20c14 0 22 7 22 18 0 10-8 18-22 18H45m22 0 22 21" fill="none" stroke="#11130f" stroke-width="9" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="91" cy="92" r="10" fill="#11130f" />
+  <circle cx="91" cy="92" r="7" fill="#ff694f" />
+</svg>

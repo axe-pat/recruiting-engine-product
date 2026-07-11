@@ -4,7 +4,7 @@
 
 The hosted surface is a product proof, not a public copy of the private recruiting workspace. It should make the engine's architecture, operating depth, evolution, and verified scale legible while keeping every candidate, contact, message, and application artifact private.
 
-The public runtime therefore reads one reviewed, static module: `lib/product-data.ts`. It never imports either production repository, opens local run artifacts, connects to signed-in browser state, or receives credentials.
+The unpaired public runtime reads one reviewed, static module: `lib/product-data.ts`. It never imports either production repository, opens local run artifacts, connects to signed-in browser state, or receives credentials. A paired browser can call the separately installed loopback companion directly; those requests are not proxied through or stored by the hosted site.
 
 ## Data classes
 
@@ -47,24 +47,20 @@ The portable surface must never contain:
 ## Portability architecture
 
 ```text
-Private production artifacts
-        │
-        │ manual aggregate review
-        ▼
-Allowlisted, non-identifying metrics
-        │
-        │ typed static snapshot
-        ▼
-lib/product-data.ts
-        │
-        ├── real aggregate proof
-        └── explicitly fictional demos
-        │
-        ▼
-Hosted read-only product surface
+Public proof lane                         Private operating lane
+Private production artifacts             Curated uploads and reviewed imports
+        │                                           │
+        │ manual aggregate review                   ▼
+        ▼                                  Loopback companion + SQLite
+Allowlisted metrics + fictional demos              │
+        │                                           ├── portable runs
+        ▼                                           └── read-only existing adapter
+Hosted command center                              │
+        │                                           │ direct, paired requests
+        └───────────────────────────────────────────┘
 ```
 
-This boundary makes the showcase deployable without either private repository. A clean checkout needs only the product repository and its ordinary build dependencies.
+This boundary keeps the hosted build independently deployable while allowing a user to opt into a real private workspace. A clean checkout needs only the product repository, Node for the command center, and Python's standard library for the companion.
 
 ## Evidence semantics
 
@@ -97,8 +93,12 @@ The snapshot can truthfully support a story about:
 - a shared daily queue that deduplicated 128 observations into 119 companies before applying a 50-item operating cap;
 - aggregate relationship and outcome telemetry that closes the loop between product decisions and real-world results.
 
-It cannot support claims that the showcase is a multi-user SaaS product, that demo companies are real pipeline opportunities, or that the static snapshot is live production telemetry.
+It cannot support claims that the product is a hosted multi-user SaaS, that demo companies are real pipeline opportunities, that the static snapshot is live production telemetry, or that a new portable user inherits the private operator's historical data and configured sources.
 
-## Future portable mode
+## Current portable mode
 
-A future version may add a local-only import adapter that produces the same aggregate schema. That adapter should remain outside the hosted runtime and default to deny: new fields are excluded until explicitly allowlisted and reviewed. The safer product direction is to make the schema more expressive, not to move private source material into the public deployment.
+The local companion now provides per-user SQLite state, private document storage, one-time pairing, reviewed CSV/job intake, deterministic decision runs, reports, and a strict outreach review state machine. It starts empty and labels unconfigured sources explicitly. It does not parse resumes, calculate semantic fit, call models, scrape third-party sites, submit applications, or send messages.
+
+The existing-engine adapter is read-only. It follows the exact summary → manifest → report authority chain and keeps current workspace snapshots separate from immutable run evidence. Live scheduling and execution remain owned by the separately installed production system.
+
+The Chrome extension is an explicit intake and approval surface. It has no persistent content script or send action, and it refuses LinkedIn page capture. Captured context travels to the loopback companion only after a user action.

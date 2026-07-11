@@ -6,8 +6,12 @@ export function SiteFooter() {
         <h2>One person played the user and the PM. AI played the engineering team.</h2>
       </div>
       <div className="footer-links">
+        <a href="/install">Install the private product</a>
+        <a href="/app">Open the working product</a>
+        <a href="/app/onboarding">Create a private workspace</a>
         <a href="/story">Read the product story</a>
         <a href="/architecture">Inspect the system</a>
+        <a href="/privacy">Privacy</a>
         <a href="https://github.com/axe-pat/Outreach" target="_blank" rel="noreferrer">
           Outreach repo ↗
         </a>
@@ -20,8 +24,9 @@ export function SiteFooter() {
         </a>
       </div>
       <p className="footer-note">
-        Public product surface uses sanitized aggregates and fictionalized demo rows. Personal
-        application materials, messages, and relationship data stay private.
+        The hosted preview uses sanitized aggregates and fictionalized rows. The working app pairs
+        directly with a local companion, so personal materials, messages, and relationship data stay
+        on the user&apos;s device.
       </p>
     </footer>
   );

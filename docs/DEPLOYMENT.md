@@ -68,7 +68,10 @@ using `extension/STORE_REVIEW.md`.
 macOS operators can run the companion as a loopback-only per-user service using
 the reversible, non-secret LaunchAgent flow in
 [`OPERATOR_SETUP.md`](OPERATOR_SETUP.md). This local service installation is
-separate from publishing the hosted site.
+separate from publishing the hosted site. The plist runs a supported
+non-Desktop Python directly with the product checkout on `PYTHONPATH`, avoiding
+macOS's protected Desktop script-execution failure while keeping the live local
+engines as the source of truth.
 
 Publishing to the Chrome Web Store is a separate external release gate. It needs
 the owner's verified developer account, final support contact, listing assets,

@@ -1141,6 +1141,12 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
             )
             (outreach / "workspace").mkdir(parents=True)
             (outreach / "main.py").write_text("# fixed fixture\n", encoding="utf-8")
+            resume_python = resume / "venv" / "bin" / "python"
+            outreach_python = outreach / ".venv" / "bin" / "python"
+            resume_python.parent.mkdir(parents=True)
+            outreach_python.parent.mkdir(parents=True)
+            resume_python.symlink_to(sys.executable)
+            outreach_python.symlink_to(sys.executable)
             runtime.mkdir()
             for path in (
                 runtime / "nightly_scheduler.lock",
@@ -1158,8 +1164,8 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
                 outreach_root=outreach,
                 runtime_dir=runtime,
                 attestation_path=attestation,
-                resume_python=Path(sys.executable),
-                outreach_python=Path(sys.executable),
+                resume_python=resume_python,
+                outreach_python=outreach_python,
             )
             backend = OperatorBackend(settings)
             self.assertEqual(
@@ -1314,6 +1320,7 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
                 running = backend.get_job(queued["id"])
                 self.assertEqual(running["status"], "running")
                 argv = runner.call_args.args[0]
+                self.assertEqual(argv[0], str(resume_python.absolute()))
                 self.assertEqual(
                     argv[1:],
                     [
@@ -1473,6 +1480,7 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
             account_argv, _, _, _ = backend._fixed_action_argv(
                 "accounts.refresh", {}
             )
+            self.assertEqual(account_argv[0], str(outreach_python.absolute()))
             self.assertEqual(
                 account_argv[1:],
                 [

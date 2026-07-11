@@ -46,6 +46,15 @@ operator_pick_companion_python() {
   fi
 
   local candidate
+  # Prefer an interpreter outside the Desktop checkouts. launchd can execute
+  # this binary even when macOS protects scripts and virtualenvs on Desktop;
+  # PYTHONPATH still points at the live product checkout.
+  candidate="$(command -v python3 2>/dev/null || true)"
+  if [ -n "${candidate}" ] && [ -x "${candidate}" ] && operator_python_is_supported "${candidate}"; then
+    printf '%s\n' "${candidate}"
+    return
+  fi
+
   for candidate in \
     "${RECRUITING_ENGINE_RESUME_ROOT}/venv/bin/python" \
     "${RECRUITING_ENGINE_OUTREACH_ROOT}/.venv/bin/python"
@@ -56,8 +65,7 @@ operator_pick_companion_python() {
     fi
   done
 
-  candidate="$(command -v python3 2>/dev/null || true)"
-  printf '%s\n' "${candidate:-python3}"
+  printf '%s\n' "python3"
 }
 
 operator_resolve_config() {

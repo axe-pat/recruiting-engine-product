@@ -111,7 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--label", required=True)
     parser.add_argument("--working-directory", required=True)
-    parser.add_argument("--start-script", required=True)
+    parser.add_argument("--python", required=True)
     parser.add_argument("--log-directory", required=True)
     parser.add_argument("--env", action="append", default=[])
     return parser
@@ -122,14 +122,16 @@ def main() -> int:
     if not LABEL.fullmatch(args.label):
         raise ValueError("LaunchAgent label contains unsupported characters")
     working_directory = require_absolute("working directory", args.working_directory)
-    start_script = require_absolute("start script", args.start_script)
+    python = require_absolute("Python executable", args.python)
+    if not Path(python).is_file():
+        raise ValueError(f"Python executable does not exist: {python}")
     log_directory = require_absolute("log directory", args.log_directory)
     environment = parse_environment(args.env)
     validate_environment(environment)
 
     payload = {
         "Label": args.label,
-        "ProgramArguments": ["/bin/bash", start_script],
+        "ProgramArguments": [python, "-m", "recruiting_companion", "serve"],
         "WorkingDirectory": working_directory,
         "EnvironmentVariables": environment,
         "RunAtLoad": True,

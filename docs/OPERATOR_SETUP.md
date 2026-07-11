@@ -43,7 +43,11 @@ scripts/install-operator-companion-launch-agent.sh --production-preflight
 
 The installer writes one plist under `~/Library/LaunchAgents/`, creates the log
 directory, loads the service, and starts it. Absolute paths are resolved when
-the plist is generated. Re-run the installer after moving any checkout.
+the plist is generated. The LaunchAgent executes a supported system/Homebrew
+Python directly from the home directory while `PYTHONPATH` points at the live
+product checkout. This avoids asking `launchd` to execute a script or virtualenv
+inside macOS's protected Desktop folder. Re-run the installer after moving any
+checkout.
 
 The plist contains only an allowlisted set of paths, loopback settings, and
 non-secret runtime values. Pairing codes and bearer tokens are never embedded;
@@ -73,11 +77,12 @@ the next load configuration, while the latter is the currently loaded job.
 Inspect both when troubleshooting a stale service.
 
 Because the default checkouts live under Desktop, macOS privacy controls can
-allow an interactive Terminal probe while denying the background LaunchAgent.
-If the stderr log reports `Operation not permitted`, either move the checkouts
-outside a protected folder or grant the service's exact Python executable the
-required macOS file access; Terminal permission alone does not authorize
-launchd.
+still allow an interactive probe while denying a background interpreter access
+to repository data. The default direct-Python launcher avoids the common
+protected-script failure. If the stderr log still reports `Operation not
+permitted`, either move the checkouts outside a protected folder or grant the
+plist's exact Python executable the required macOS file access; Terminal
+permission alone does not authorize `launchd`.
 
 ## Uninstall
 

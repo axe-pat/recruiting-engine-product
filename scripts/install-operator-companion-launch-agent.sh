@@ -52,7 +52,6 @@ plist_path="${launch_agents_dir}/${label}.plist"
 domain="gui/$(id -u)"
 service="${domain}/${label}"
 renderer="${SCRIPT_DIR}/render-operator-launch-agent.py"
-start_script="${SCRIPT_DIR}/start-operator-companion.sh"
 managed_by="Recruiting Engine Product operator companion installer"
 
 was_loaded=0
@@ -73,8 +72,8 @@ fi
 render_command=(
   "${RECRUITING_ENGINE_COMPANION_PYTHON}" "${renderer}"
   --label "${label}"
-  --working-directory "${OPERATOR_PRODUCT_ROOT}"
-  --start-script "${start_script}"
+  --working-directory "${HOME}"
+  --python "${RECRUITING_ENGINE_COMPANION_PYTHON}"
   --log-directory "${RECRUITING_ENGINE_OPERATOR_LOG_DIR}"
   --env "PYTHONPATH=${PYTHONPATH}"
   --env "PYTHONUNBUFFERED=${PYTHONUNBUFFERED}"

@@ -1030,9 +1030,10 @@ class OperatorBackend:
             raise ValidationError("resume root is not configured")
         if not self.settings.attestation_path:
             raise ValidationError("attestation is not configured")
-        python = self.settings.resume_python.resolve(strict=True)
-        if not python.is_file() or not os.access(python, os.X_OK):
-            raise ValidationError("configured resume Python is not executable")
+        python = _preserved_executable_path(
+            self.settings.resume_python,
+            "resume Python",
+        )
         if self.settings.resumegen_root.is_symlink():
             raise ValidationError("resume root cannot be a symlink")
         root = self.settings.resumegen_root.resolve(strict=True)
@@ -1331,9 +1332,10 @@ class OperatorBackend:
     def _outreach_surface(self) -> tuple[Path, Path]:
         if not self.settings.outreach_python or not self.settings.outreach_root:
             raise ValidationError("Outreach Python and root are required")
-        python = self.settings.outreach_python.resolve(strict=True)
-        if not python.is_file() or not os.access(python, os.X_OK):
-            raise ValidationError("configured Outreach Python is not executable")
+        python = _preserved_executable_path(
+            self.settings.outreach_python,
+            "Outreach Python",
+        )
         root = _strict_allowlisted_path(
             self.settings.outreach_root,
             self.settings.outreach_root,
@@ -1345,9 +1347,10 @@ class OperatorBackend:
     def _resume_surface(self, script_relative: str) -> tuple[Path, Path]:
         if not self.settings.resume_python or not self.settings.resumegen_root:
             raise ValidationError("ResumeGenerator Python and root are required")
-        python = self.settings.resume_python.resolve(strict=True)
-        if not python.is_file() or not os.access(python, os.X_OK):
-            raise ValidationError("configured ResumeGenerator Python is not executable")
+        python = _preserved_executable_path(
+            self.settings.resume_python,
+            "ResumeGenerator Python",
+        )
         root = _strict_allowlisted_path(
             self.settings.resumegen_root,
             self.settings.resumegen_root,
@@ -2647,6 +2650,19 @@ def _as_number(value: Any) -> float | None:
     if number != number or number in {float("inf"), float("-inf")}:
         return None
     return number
+
+
+def _preserved_executable_path(candidate: Path, label: str) -> Path:
+    """Validate an executable without resolving away a virtualenv launcher.
+
+    Python virtualenv entrypoints are commonly symlinks to a base interpreter.
+    Executing the resolved target loses the adjacent ``pyvenv.cfg`` and its
+    installed packages, so the fixed argv must retain the configured path.
+    """
+    path = candidate.expanduser().absolute()
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise ValidationError(f"configured {label} is not executable")
+    return path
 
 
 def _strict_allowlisted_path(root: Path, candidate: Path, *, expect: str) -> Path:

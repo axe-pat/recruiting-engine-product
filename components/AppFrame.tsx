@@ -546,6 +546,14 @@ export function AppFrame({ view }: { view: AppView }) {
   return (
     <main className="operating-app">
       <aside className={mobileNav ? "app-sidebar sidebar-open" : "app-sidebar"} id="product-navigation">
+        <button
+          className="app-sidebar-close"
+          type="button"
+          onClick={() => setMobileNav(false)}
+          aria-label="Close navigation"
+        >
+          ×
+        </button>
         <a className="app-brand" href="/" aria-label="Recruiting Engine product site">
           <span>RE</span>
           <div>

@@ -73,6 +73,7 @@ test("server-renders the working command center and all human gates", async () =
   assert.match(html, /Fictional preview data/);
   assert.match(html, /Preview run state/);
   assert.match(html, /Pair the local companion/);
+  assert.match(html, /Close navigation/);
   assert.doesNotMatch(html, /auto-send/i);
 });
 

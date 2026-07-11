@@ -64,6 +64,10 @@ body {
   color: #f8f8f1;
 }
 
+.app-sidebar-close {
+  display: none;
+}
+
 .app-brand {
   display: flex;
   gap: 12px;
@@ -1272,6 +1276,8 @@ body {
   .operating-app { display: block; }
   .app-sidebar { position: fixed; left: 0; visibility: hidden; transform: translateX(-105%); width: 246px; transition: transform 180ms ease, visibility 180ms ease; }
   .app-sidebar.sidebar-open { visibility: visible; transform: translateX(0); box-shadow: 20px 0 60px rgb(0 0 0 / 0.2); }
+  .app-sidebar-close { position: absolute; top: 24px; right: 18px; display: grid; width: 38px; height: 38px; place-items: center; border: 1px solid #34392f; border-radius: 12px; background: #20231e; color: #f8f8f1; font-size: 22px; line-height: 1; cursor: pointer; }
+  .app-sidebar-close:hover { border-color: #646b5d; background: #292d26; }
   .mobile-nav-button { display: block; }
   .app-topbar { padding-inline: 18px; }
   .app-content { width: calc(100% - 36px); padding-top: 28px; }

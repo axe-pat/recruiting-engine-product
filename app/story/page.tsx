@@ -1,5 +1,6 @@
+/* eslint-disable @next/next/no-html-link-for-pages -- static export needs full-page navigation */
+
 import type { Metadata } from "next";
-import Link from "next/link";
 
 import { SiteFooter } from "@/components/SiteFooter";
 import { SiteNav } from "@/components/SiteNav";
@@ -135,12 +136,12 @@ export default function StoryPage() {
           </article>
         </div>
         <div className="hero-actions">
-          <Link className="button-primary" href="/architecture">
+          <a className="button-primary" href="/architecture">
             Inspect the architecture <span aria-hidden="true">→</span>
-          </Link>
-          <Link className="button-secondary" href="/">
+          </a>
+          <a className="button-secondary" href="/">
             Return to the product <span aria-hidden="true">↗</span>
-          </Link>
+          </a>
         </div>
       </section>
 
@@ -148,4 +149,3 @@ export default function StoryPage() {
     </main>
   );
 }
-

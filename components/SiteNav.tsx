@@ -1,4 +1,4 @@
-import Link from "next/link";
+/* eslint-disable @next/next/no-html-link-for-pages -- static export needs full-page navigation */
 
 const links = [
   { href: "/#product", label: "Product" },
@@ -9,7 +9,7 @@ const links = [
 export function SiteNav() {
   return (
     <header className="site-nav">
-      <Link className="brand" href="/" aria-label="Recruiting Engine home">
+      <a className="brand" href="/" aria-label="Recruiting Engine home">
         <span className="brand-mark" aria-hidden="true">
           RE
         </span>
@@ -17,12 +17,12 @@ export function SiteNav() {
           <strong>Recruiting Engine</strong>
           <small>Built in public. Run in production.</small>
         </span>
-      </Link>
+      </a>
       <nav aria-label="Primary navigation">
         {links.map((link) => (
-          <Link href={link.href} key={link.href}>
+          <a href={link.href} key={link.href}>
             {link.label}
-          </Link>
+          </a>
         ))}
       </nav>
       <a
@@ -36,4 +36,3 @@ export function SiteNav() {
     </header>
   );
 }
-

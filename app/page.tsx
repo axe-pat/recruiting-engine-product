@@ -1,5 +1,3 @@
-import Link from "next/link";
-
 import { EngineConsole, type ConsoleQueueItem, type ConsoleStage } from "@/components/EngineConsole";
 import { SiteFooter } from "@/components/SiteFooter";
 import { SiteNav } from "@/components/SiteNav";
@@ -111,9 +109,9 @@ export default function Home() {
             <a className="button-primary" href="#proof">
               Explore the product <span aria-hidden="true">↓</span>
             </a>
-            <Link className="button-secondary" href="/story">
+            <a className="button-secondary" href="/story">
               Read the build story <span aria-hidden="true">→</span>
-            </Link>
+            </a>
           </div>
           <div className="hero-meta" aria-label="Build facts">
             <div>

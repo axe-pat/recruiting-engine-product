@@ -1,5 +1,3 @@
-import Link from "next/link";
-
 export function SiteFooter() {
   return (
     <footer className="site-footer">
@@ -8,8 +6,8 @@ export function SiteFooter() {
         <h2>One person played the user and the PM. AI played the engineering team.</h2>
       </div>
       <div className="footer-links">
-        <Link href="/story">Read the product story</Link>
-        <Link href="/architecture">Inspect the system</Link>
+        <a href="/story">Read the product story</a>
+        <a href="/architecture">Inspect the system</a>
         <a href="https://github.com/axe-pat/Outreach" target="_blank" rel="noreferrer">
           Outreach repo ↗
         </a>
@@ -28,4 +26,3 @@ export function SiteFooter() {
     </footer>
   );
 }
-

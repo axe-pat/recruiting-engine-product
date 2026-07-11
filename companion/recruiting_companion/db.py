@@ -171,6 +171,30 @@ CREATE TABLE IF NOT EXISTS intakes (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_intakes_user ON intakes(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS operator_jobs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    command_id TEXT NOT NULL,
+    parameters_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL,
+    requested_scope TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    confirmation_valid INTEGER NOT NULL DEFAULT 0 CHECK (confirmation_valid IN (0, 1)),
+    argv_sha256 TEXT NOT NULL DEFAULT '',
+    lock_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    returncode INTEGER,
+    stdout_sha256 TEXT NOT NULL DEFAULT '',
+    stderr_sha256 TEXT NOT NULL DEFAULT '',
+    stdout_lines INTEGER NOT NULL DEFAULT 0,
+    stderr_lines INTEGER NOT NULL DEFAULT 0,
+    result_code TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_operator_jobs_user
+    ON operator_jobs(user_id, requested_at DESC);
 """
 
 
@@ -190,6 +214,17 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            operator_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(operator_jobs)"
+                ).fetchall()
+            }
+            if "parameters_json" not in operator_columns:
+                connection.execute(
+                    "ALTER TABLE operator_jobs ADD COLUMN "
+                    "parameters_json TEXT NOT NULL DEFAULT '{}'"
+                )
         try:
             self.path.chmod(0o600)
         except OSError:

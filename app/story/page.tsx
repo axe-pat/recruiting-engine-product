@@ -53,6 +53,13 @@ const chapters = [
       "The next product question was portability. A new user cannot bring months of accumulated resumes, profile framings, source state, and relationship history on day one. The release now starts from one baseline resume, a compact target frame, and reviewed imports. A hosted command center pairs with a private local companion and a narrow Chrome side panel, so onboarding, decisions, reports, and outreach review work without turning personal recruiting data into a hosted database.",
     quote: "Make the accumulated intelligence portable without pretending every new user starts with the same history.",
   },
+  {
+    label: "07 · The operator cockpit",
+    title: "The product surface became the front door to the real operating system.",
+    body:
+      "Portability did not need to erase the original power-user workflow. Existing-engine mode now pairs the same interface with the installed account tracker, current apply queue, story and communication engines, source health, and exact daily reports. Fixed local actions replace memorized commands, while concurrency locks and typed confirmation keep the nightly pipeline, paid generation, external sends, and final submission inside explicit boundaries.",
+    quote: "Prove the product publicly. Operate the private system deeply. Never confuse the two data boundaries.",
+  },
 ] as const;
 
 export default function StoryPage() {

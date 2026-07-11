@@ -102,8 +102,8 @@ export default function Home() {
           <p className="hero-description">
             Recruiting Engine turns fragmented job, company, and relationship signals into one
             reviewed decision: apply, reach out, follow up, watch, or skip. I built and operated it
-            as the product manager, first customer, and daily user—using AI coding agents as my
-            engineering team.
+            as the product manager, first customer, and daily user—now through a private operator
+            cockpit backed by the real local engines, with AI coding agents as my engineering team.
           </p>
           <div className="hero-actions">
             <a className="button-primary" href="/app">

@@ -15,7 +15,7 @@ The product now has three cooperating surfaces:
 | Surface | Responsibility | Data boundary |
 |---|---|---|
 | Hosted command center | Onboarding, dashboards, sources, queues, runs, applications, outreach review, and reports | Static preview until paired |
-| Local companion | SQLite system of record, document storage, pairing, imports, deterministic portable runs, review state, and existing-engine evidence | User device only |
+| Local companion | SQLite system of record, document storage, pairing, imports, deterministic portable runs, existing-engine evidence, and audited fixed actions | User device only |
 | Chrome companion | Explicit page/paste intake and recipient-plus-draft approval | Device-local; no send action |
 
 The original operating depth remains in two source engines:
@@ -34,7 +34,7 @@ Hosted command center (public code, fictional preview)
                 ▼
 Local companion (SQLite + private document directory)
        │                         │
-       │ portable mode           │ read-only existing adapter
+       │ portable mode           │ guarded operator adapter
        ▼                         ▼
 Reviewed imports          ResumeGenerator + Outreach
 deterministic queue        exact summary → manifest → report evidence
@@ -53,6 +53,9 @@ operational records go directly to the companion running on that device.
 - `/app/onboarding` — four-step private onboarding with curated uploads;
 - `/app/sources` — Handshake/generic CSV import and explicit connector states;
 - `/app/queue` — one human-gated daily decision queue;
+- `/app/accounts` — real account portfolio, action queue, tiers, and stages;
+- `/app/stories` — private story, positioning, and communication inventories;
+- `/app/operations` — fixed local capabilities, production guards, and job history;
 - `/app/runs` and `/app/reports` — run-scoped evidence and decision briefs;
 - `/app/applications` and `/app/outreach` — execution state and full-draft approval;
 - `/app/settings` — pairing, portable/existing mode, and engine-binding status;
@@ -91,7 +94,7 @@ token rotation, source import schema, and security model.
 ## Bind an existing engine
 
 Portable mode starts empty and makes only claims it can prove from the user's
-local imports. Existing-engine mode is a read-only evidence adapter over a
+local imports. Existing-engine mode is a private operator cockpit over a
 separately installed ResumeGenerator + Outreach system:
 
 ```bash
@@ -103,10 +106,25 @@ python3 -m recruiting_companion serve
 ```
 
 The adapter follows exact run pointers and refuses mutable `latest`/`current`
-aliases. It never invokes the live pipeline. The installed scheduler remains the
-only production-run owner; the app refreshes verified evidence. See
+aliases. Bounded local projections and fixed, confirmed actions are available;
+arbitrary commands, external sends, final submission, and full nightly execution
+are not. The installed scheduler remains the only production-run owner. See the
+[operator cockpit contract](docs/OPERATOR_COCKPIT.md),
 [the adapter contract](docs/EXISTING_ENGINE_ADAPTER.md) and
 [run-evidence contract](docs/RUN_EVIDENCE_CONTRACT.md).
+
+On macOS, the repository includes a loopback-only, reversible operator service
+setup using sibling `ResumeGenerator v1` and `Outreach` checkouts by default:
+
+```bash
+scripts/probe-operator-companion.sh --production-preflight
+scripts/install-operator-companion-launch-agent.sh --dry-run
+scripts/install-operator-companion-launch-agent.sh --production-preflight
+```
+
+The generated LaunchAgent contains no credentials or pairing tokens. See the
+[macOS operator setup](docs/OPERATOR_SETUP.md) for overrides, logs, inspection,
+pairing, and uninstall commands.
 
 ## Install the Chrome companion
 

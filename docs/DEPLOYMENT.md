@@ -65,6 +65,11 @@ extension validation, create a zip whose root is the contents of `extension/`,
 confirm the hosted privacy policy is live, and complete the store data-use form
 using `extension/STORE_REVIEW.md`.
 
+macOS operators can run the companion as a loopback-only per-user service using
+the reversible, non-secret LaunchAgent flow in
+[`OPERATOR_SETUP.md`](OPERATOR_SETUP.md). This local service installation is
+separate from publishing the hosted site.
+
 Publishing to the Chrome Web Store is a separate external release gate. It needs
 the owner's verified developer account, final support contact, listing assets,
 and Google review. A source push or GitHub Pages deploy does not imply store

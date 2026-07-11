@@ -13,6 +13,10 @@ cd recruiting-engine-product
 export PYTHONPATH="$PWD/companion"
 python3 -m recruiting_companion serve`;
 
+const operatorCommands = `scripts/probe-operator-companion.sh --production-preflight
+scripts/install-operator-companion-launch-agent.sh --production-preflight
+scripts/start-operator-companion.sh show-pairing`;
+
 export default function InstallPage() {
   return (
     <main className="inner-page">
@@ -29,6 +33,16 @@ export default function InstallPage() {
           <a className="button-secondary" href="https://github.com/axe-pat/recruiting-engine-product" target="_blank" rel="noreferrer">Open source ↗</a>
         </div>
       </header>
+
+      <section className="install-operator-card section-shell">
+        <div>
+          <span className="section-index">Existing operator setup</span>
+          <h2>Make this the front door to your installed Recruiting Engine.</h2>
+          <p>The macOS service discovers sibling ResumeGenerator and Outreach checkouts, connects the account tracker, apply queue, story and communication engines, and exact reports, then stays available after login.</p>
+          <a className="install-action" href="https://github.com/axe-pat/recruiting-engine-product/blob/main/docs/OPERATOR_SETUP.md" target="_blank" rel="noreferrer">Read the operator setup →</a>
+        </div>
+        <pre><code>{operatorCommands}</code></pre>
+      </section>
 
       <section className="install-steps">
         <article>
@@ -70,7 +84,7 @@ export default function InstallPage() {
         <div><span className="section-index">What this release does</span><h2>A real portable core with an honest boundary.</h2></div>
         <div className="install-boundary-grid">
           <article><strong>Portable users</strong><p>Uploads, reviewed job imports, durable state, deterministic queues, run reports, browser intake, and explicit outreach approval.</p></article>
-          <article><strong>Existing operators</strong><p>Read-only binding to exact production evidence while the installed signed scheduler retains live-run authority.</p></article>
+          <article><strong>Existing operators</strong><p>Live local projections across trackers, queues, stories, communications, and exact reports, with fixed desktop actions behind explicit guards.</p></article>
           <article><strong>Not claimed</strong><p>No hosted multi-tenant database, silent LinkedIn automation, application auto-submit, or message auto-send.</p></article>
         </div>
       </section>

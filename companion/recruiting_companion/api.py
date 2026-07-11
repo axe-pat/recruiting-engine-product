@@ -16,6 +16,7 @@ from . import __version__
 from .auth import TokenStore
 from .config import Settings
 from .existing_adapter import ExistingEngineAdapter
+from .operator_backend import OperatorBackend
 from .service import CompanionService, ServiceError, ValidationError
 
 
@@ -272,6 +273,70 @@ class CompanionHandler(BaseHTTPRequestHandler):
                 origin,
             )
             return
+        if route.startswith("/operator/"):
+            operator = OperatorBackend(self.server.settings)
+            if method == "GET" and route == "/operator/overview":
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"operator": operator.overview()},
+                    origin,
+                )
+                return
+            if method == "GET" and route == "/operator/capabilities":
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"capabilities": operator.capabilities()},
+                    origin,
+                )
+                return
+            if method == "GET" and route == "/operator/assets":
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"assets": operator.assets()},
+                    origin,
+                )
+                return
+            if route == "/operator/jobs":
+                if method == "GET":
+                    items = operator.list_jobs(**self._pagination(query))
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {"items": items, "count": len(items)},
+                        origin,
+                    )
+                    return
+                if method == "POST":
+                    body = self._json_body()
+                    unknown = set(body) - {
+                        "command_id",
+                        "confirmation",
+                        "parameters",
+                    }
+                    if unknown:
+                        raise ValidationError(
+                            "unsupported operator job fields: "
+                            + ", ".join(sorted(unknown))
+                        )
+                    job = operator.submit_job(
+                        command_id=str(body.get("command_id") or ""),
+                        confirmation=str(body.get("confirmation") or ""),
+                        parameters=body.get("parameters", {}),
+                        requested_scope=getattr(self, "_auth_scope", "local"),
+                    )
+                    self._send_json(
+                        HTTPStatus.CREATED,
+                        {"operator_job": job},
+                        origin,
+                    )
+                    return
+            operator_job_match = re.fullmatch(r"/operator/jobs/([^/]+)", route)
+            if method == "GET" and operator_job_match:
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"operator_job": operator.get_job(operator_job_match.group(1))},
+                    origin,
+                )
+                return
         if route == "/onboarding" and method == "POST":
             payload, uploads = self._structured_body()
             self._send_json(
@@ -509,11 +574,18 @@ class CompanionHandler(BaseHTTPRequestHandler):
             ("POST", "/documents"),
             ("POST", "/imports/jobs"),
             ("POST", "/runs"),
+            ("GET", "/operator/overview"),
+            ("GET", "/operator/capabilities"),
+            ("GET", "/operator/assets"),
+            ("GET", "/operator/jobs"),
+            ("POST", "/operator/jobs"),
         }
         allowed = (method, route) in exact_routes
         if method == "PATCH" and re.fullmatch(r"/outreach/[^/]+", route):
             allowed = True
         if method == "POST" and re.fullmatch(r"/outreach/[^/]+/approve", route):
+            allowed = True
+        if method == "GET" and re.fullmatch(r"/operator/jobs/[^/]+", route):
             allowed = True
         if allowed:
             return True

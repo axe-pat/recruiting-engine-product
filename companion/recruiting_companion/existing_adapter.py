@@ -171,6 +171,7 @@ class ExistingEngineAdapter:
             "scheduler",
             "pipeline",
             "workbook",
+            "queue",
             "adapter_mutation",
         }
         lock_states = {name: locks.get(name, "unavailable") for name in required_lock_names}
@@ -180,7 +181,7 @@ class ExistingEngineAdapter:
                 "status": "busy",
                 "captured_at": generated_at,
                 "reasons": [
-                    "A scheduler, pipeline, workbook, or adapter lock is currently owned; mutable workspace files were not read."
+                    "A scheduler, pipeline, workbook, queue, or adapter lock is currently owned; mutable workspace files were not read."
                 ],
             }
         elif status.get("roots_available") and all(
@@ -191,10 +192,31 @@ class ExistingEngineAdapter:
             )
         else:
             response["current_workspace"]["reasons"] = [
-                "Mutable workspace capture requires scheduler, pipeline, workbook, and adapter locks to all be explicitly free."
+                "Mutable workspace capture requires scheduler, pipeline, workbook, queue, and adapter locks to all be explicitly free."
             ]
             response["current_workspace"]["lock_states"] = lock_states
         return response
+
+    def verified_run_projections(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Project only summaries that pass the complete run evidence chain."""
+        if not (
+            self.settings.resumegen_root
+            and self.settings.outreach_root
+            and self.settings.attestation_path
+            and self.settings.attestation_path.is_file()
+        ):
+            return []
+        verified, _ = self._scan_runs()
+        projections: list[dict[str, Any]] = []
+        for run in verified[-min(max(int(limit), 1), 50) :]:
+            try:
+                projections.append(self._project_verified_run(run))
+            except (ValueError, OSError, json.JSONDecodeError):
+                continue
+        return projections
+
+    def lock_states(self) -> dict[str, str]:
+        return self._lock_states()
 
     def _project_verified_run(self, run: dict[str, Any]) -> dict[str, Any]:
         assert self.settings.resumegen_root is not None
@@ -357,6 +379,7 @@ class ExistingEngineAdapter:
                         if isinstance(value, str) and value
                     }
                 ),
+                "material_flags": _queue_material_flags(priority, queue_root),
             }
             result["evidence"]["application_queue_manifest"] = self._evidence_for_content(
                 manifest_path,
@@ -414,6 +437,14 @@ class ExistingEngineAdapter:
             ),
             "workbook": (
                 self.settings.resumegen_root / "discovery" / ".jobs.lock"
+                if self.settings.resumegen_root
+                else None
+            ),
+            "queue": (
+                self.settings.resumegen_root
+                / "apps"
+                / "Apply queues"
+                / ".current_apply_queue.lock"
                 if self.settings.resumegen_root
                 else None
             ),
@@ -527,7 +558,12 @@ class ExistingEngineAdapter:
         report, report_evidence = self._read_object_with_evidence(
             report_path, self.settings.outreach_root
         )
-        self._validate_report(report, summary_path=path, created_at=summary["created_at"])
+        self._validate_report(
+            report,
+            summary_path=path,
+            created_at=summary["created_at"],
+            run_id=run_id,
+        )
 
         html_evidence: dict[str, Any] | None = None
         html_pointer = report_pointer.get("html_report_artifact")
@@ -626,10 +662,13 @@ class ExistingEngineAdapter:
         *,
         summary_path: Path,
         created_at: str,
+        run_id: str,
     ) -> None:
         assert self.settings.resumegen_root is not None
         if report.get("report_mode") != "run_scoped":
             raise ValueError("outreach report is not run_scoped")
+        if report.get("run_id") != run_id:
+            raise ValueError("outreach report run_id does not match the selected run")
         nightly_path = self._resolve_pointer(
             self.settings.resumegen_root,
             report.get("nightly_summary"),
@@ -807,3 +846,79 @@ def _safe_timestamp(value: Any) -> str:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).isoformat()
     except ValueError:
         return ""
+
+
+def _queue_material_flags(
+    rows: list[Any],
+    queue_root: Path,
+) -> dict[str, int]:
+    counts = {
+        "folders_resolved": 0,
+        "resume_ready": 0,
+        "cover_letter_ready": 0,
+        "job_description_ready": 0,
+        "strategy_ready": 0,
+        "intel_ready": 0,
+    }
+    try:
+        resolved_root = queue_root.resolve(strict=True)
+    except OSError:
+        return counts
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_folder = row.get("folder_path")
+        if not isinstance(raw_folder, str) or not raw_folder:
+            continue
+        candidate = Path(raw_folder).expanduser()
+        if not candidate.is_absolute():
+            candidate = queue_root / candidate
+        try:
+            unresolved_relative = candidate.absolute().relative_to(
+                queue_root.absolute()
+            )
+            cursor = queue_root.absolute()
+            if cursor.is_symlink():
+                continue
+            unsafe = False
+            for part in unresolved_relative.parts:
+                cursor = cursor / part
+                if cursor.is_symlink():
+                    unsafe = True
+                    break
+            if unsafe:
+                continue
+            folder = candidate.resolve(strict=True)
+        except (OSError, ValueError):
+            continue
+        if not folder.is_relative_to(resolved_root) or not folder.is_dir():
+            continue
+        counts["folders_resolved"] += 1
+        names = {
+            item.name.casefold()
+            for item in folder.iterdir()
+            if item.is_file() and not item.is_symlink()
+        }
+        if any(
+            name.startswith("resume_")
+            and name.endswith((".docx", ".pdf", ".txt"))
+            for name in names
+        ):
+            counts["resume_ready"] += 1
+        if any(
+            (
+                name.startswith("cl_")
+                or name.startswith("cover_letter")
+                or name.startswith("cover-letter")
+            )
+            and name.endswith((".docx", ".pdf", ".txt"))
+            for name in names
+        ):
+            counts["cover_letter_ready"] += 1
+        if "jd.txt" in names:
+            counts["job_description_ready"] += 1
+        if "strategy.json" in names:
+            counts["strategy_ready"] += 1
+        if "intel.txt" in names:
+            counts["intel_ready"] += 1
+    return counts

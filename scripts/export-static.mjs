@@ -16,6 +16,9 @@ const routes = [
   { path: "/app/applications", output: "app/applications/index.html" },
   { path: "/app/outreach", output: "app/outreach/index.html" },
   { path: "/app/reports", output: "app/reports/index.html" },
+  { path: "/app/accounts", output: "app/accounts/index.html" },
+  { path: "/app/stories", output: "app/stories/index.html" },
+  { path: "/app/operations", output: "app/operations/index.html" },
   { path: "/app/settings", output: "app/settings/index.html" },
 ];
 

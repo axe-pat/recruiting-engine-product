@@ -31,10 +31,13 @@ class Settings:
     max_upload_bytes: int = 10 * 1024 * 1024
     allow_remote_bind: bool = False
     hosted_origin: str = "https://axe-pat.github.io"
+    default_mode: str = "portable"
     resumegen_root: Path | None = None
     outreach_root: Path | None = None
     runtime_dir: Path | None = None
     attestation_path: Path | None = None
+    resume_python: Path | None = None
+    outreach_python: Path | None = None
     allow_live_runs: bool = False
 
     @classmethod
@@ -65,6 +68,9 @@ class Settings:
                 "RECRUITING_ENGINE_HOSTED_ORIGIN",
                 "https://axe-pat.github.io",
             ).rstrip("/"),
+            default_mode=os.environ.get(
+                "RECRUITING_ENGINE_MODE", "portable"
+            ).strip().lower(),
             resumegen_root=(
                 Path(
                     os.environ.get("RECRUITING_ENGINE_RESUME_ROOT")
@@ -97,6 +103,16 @@ class Settings:
                 if os.environ.get("RECRUITING_ENGINE_ATTESTATION_PATH")
                 else None
             ),
+            resume_python=(
+                Path(os.environ["RECRUITING_ENGINE_RESUME_PYTHON"]).expanduser()
+                if os.environ.get("RECRUITING_ENGINE_RESUME_PYTHON")
+                else None
+            ),
+            outreach_python=(
+                Path(os.environ["RECRUITING_ENGINE_OUTREACH_PYTHON"]).expanduser()
+                if os.environ.get("RECRUITING_ENGINE_OUTREACH_PYTHON")
+                else None
+            ),
             allow_live_runs=_env_bool("RECRUITING_ENGINE_ALLOW_LIVE_RUNS"),
         )
         settings.validate()
@@ -123,6 +139,10 @@ class Settings:
             )
         if not self.hosted_origin.startswith("https://"):
             raise ValueError("The hosted origin must use HTTPS")
+        if self.default_mode not in {"portable", "existing"}:
+            raise ValueError(
+                "RECRUITING_ENGINE_MODE must be portable or existing"
+            )
 
     @property
     def user_dir(self) -> Path:
@@ -138,6 +158,8 @@ class Settings:
 
     @property
     def adapter_mutation_lock_path(self) -> Path:
+        if self.runtime_dir is not None:
+            return self.runtime_dir / "operator_mutation.lock"
         return self.user_dir / "adapter-mutation.lock"
 
     def prepare(self) -> None:
@@ -148,8 +170,8 @@ class Settings:
             self.documents_dir.chmod(0o700)
         except OSError:
             pass
-        self.adapter_mutation_lock_path.touch(exist_ok=True, mode=0o600)
         try:
+            self.adapter_mutation_lock_path.touch(exist_ok=True, mode=0o600)
             self.adapter_mutation_lock_path.chmod(0o600)
         except OSError:
             pass

@@ -1,23 +1,97 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import http.client
 import json
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
+from xml.sax.saxutils import escape, quoteattr
 
 from recruiting_companion.api import make_server
 from recruiting_companion.auth import TokenStore
 from recruiting_companion.config import Settings
 from recruiting_companion.existing_adapter import ExistingEngineAdapter
+from recruiting_companion.operator_backend import OperatorBackend
 from recruiting_companion.service import (
     CompanionService,
     ConflictError,
     ValidationError,
 )
+
+
+def _column_name(index: int) -> str:
+    value = index + 1
+    result = ""
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def _write_minimal_xlsx(
+    path: Path,
+    sheets: dict[str, list[list[object]]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    workbook_sheets = []
+    relationships = []
+    worksheet_payloads: list[tuple[str, str]] = []
+    for sheet_index, (name, rows) in enumerate(sheets.items(), start=1):
+        relationship_id = f"rId{sheet_index}"
+        workbook_sheets.append(
+            f'<sheet name={quoteattr(name)} sheetId="{sheet_index}" '
+            f'r:id="{relationship_id}"/>'
+        )
+        relationships.append(
+            f'<Relationship Id="{relationship_id}" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+            f'relationships/worksheet" Target="worksheets/sheet{sheet_index}.xml"/>'
+        )
+        row_xml = []
+        for row_index, row in enumerate(rows, start=1):
+            cells = []
+            for column_index, value in enumerate(row):
+                reference = f"{_column_name(column_index)}{row_index}"
+                cells.append(
+                    f'<c r="{reference}" t="inlineStr"><is><t>'
+                    f"{escape(str(value))}</t></is></c>"
+                )
+            row_xml.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+        worksheet_payloads.append(
+            (
+                f"xl/worksheets/sheet{sheet_index}.xml",
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/'
+                'spreadsheetml/2006/main"><sheetData>'
+                + "".join(row_xml)
+                + "</sheetData></worksheet>",
+            )
+        )
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<sheets>{"".join(workbook_sheets)}</sheets></workbook>'
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(relationships)
+        + "</Relationships>"
+    )
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", rels)
+        for filename, payload in worksheet_payloads:
+            archive.writestr(filename, payload)
 
 
 class ServiceTestCase(unittest.TestCase):
@@ -29,6 +103,34 @@ class ServiceTestCase(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_environment_default_mode_only_applies_before_user_choice(self) -> None:
+        existing_settings = Settings(
+            data_dir=self.root,
+            user_id="existing-default",
+            default_mode="existing",
+        )
+        existing_service = CompanionService(existing_settings)
+        self.assertEqual(existing_service.get_preferences(), {"mode": "existing"})
+        existing_service.put_preferences(
+            {"mode": "portable", "minimum_fit_score": 7.5}
+        )
+        restarted = CompanionService(
+            Settings(
+                data_dir=self.root,
+                user_id="existing-default",
+                default_mode="existing",
+            )
+        )
+        self.assertEqual(restarted.get_preferences()["mode"], "portable")
+
+        with patch.dict(
+            "os.environ", {"RECRUITING_ENGINE_MODE": "invalid"}, clear=True
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "RECRUITING_ENGINE_MODE must be portable or existing"
+            ):
+                Settings.from_env()
 
     def test_profile_preferences_documents_and_user_isolation(self) -> None:
         profile = self.service.put_profile(
@@ -610,6 +712,10 @@ class APITestCase(unittest.TestCase):
             ("GET", "/api/v1/preferences", None),
             ("GET", "/api/v1/existing-engine/status", None),
             ("GET", "/api/v1/existing-engine/snapshot", None),
+            ("GET", "/api/v1/operator/overview", None),
+            ("GET", "/api/v1/operator/capabilities", None),
+            ("GET", "/api/v1/operator/assets", None),
+            ("GET", "/api/v1/operator/jobs", None),
             (
                 "PUT",
                 "/api/v1/profile",
@@ -653,6 +759,59 @@ class APITestCase(unittest.TestCase):
                 body=body,
             )
             self.assertIn(allowed_status, {200, 201}, path)
+
+        status, blocked_job, _ = self.request(
+            "POST",
+            "/api/v1/operator/jobs",
+            bearer=web_bearer,
+            body={"command_id": "nightly.run", "confirmation": ""},
+        )
+        self.assertEqual(status, 201)
+        operator_job = blocked_job["operator_job"]
+        self.assertEqual(operator_job["status"], "blocked")
+        self.assertEqual(operator_job["result_code"], "capability_forbidden")
+        status, fetched_job, _ = self.request(
+            "GET",
+            f"/api/v1/operator/jobs/{operator_job['id']}",
+            bearer=web_bearer,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched_job["operator_job"]["id"], operator_job["id"])
+        status, rejected_job, _ = self.request(
+            "POST",
+            "/api/v1/operator/jobs",
+            bearer=web_bearer,
+            body={"command_id": "arbitrary.shell", "confirmation": ""},
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(rejected_job["error"]["code"], "validation_error")
+        status, blocked_refresh, _ = self.request(
+            "POST",
+            "/api/v1/operator/jobs",
+            bearer=web_bearer,
+            body={
+                "command_id": "accounts.refresh",
+                "confirmation": "REFRESH_ACCOUNT_TRACKER",
+                "parameters": {},
+            },
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(blocked_refresh["operator_job"]["status"], "blocked")
+        self.assertEqual(
+            blocked_refresh["operator_job"]["requested_scope"], "web"
+        )
+        status, injected, _ = self.request(
+            "POST",
+            "/api/v1/operator/jobs",
+            bearer=web_bearer,
+            body={
+                "command_id": "application.resume.generate",
+                "confirmation": "GENERATE_ONE_RESUME_WITH_MODEL_COST",
+                "parameters": {"job_id": 1, "flags": ["--force"]},
+            },
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(injected["error"]["code"], "validation_error")
 
         status, reviewed, _ = self.request(
             "PATCH",
@@ -774,6 +933,627 @@ class APITestCase(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertEqual(imported["import"]["imported"], 1)
         self.assertEqual(imported["import"]["skipped"], 1)
+
+
+class OperatorBackendTestCase(unittest.TestCase):
+    def test_strict_audited_preflight_and_local_open_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resume = root / "resume"
+            outreach = root / "outreach"
+            runtime = root / "runtime"
+            (resume / "discovery" / "scripts").mkdir(parents=True)
+            (resume / "discovery" / "source_validation").mkdir()
+            current_queue = (
+                resume / "apps" / "Apply queues" / "current_apply_queue"
+            )
+            current_queue.mkdir(parents=True)
+            (resume / "docs" / "career_workbench").mkdir(parents=True)
+            (outreach / "workspace" / "comms_learning").mkdir(parents=True)
+            runtime.mkdir()
+            script = resume / "discovery" / "scripts" / "nightly_prompt.py"
+            script.write_text(
+                "import json\nprint(json.dumps({'status': 'valid'}))\n",
+                encoding="utf-8",
+            )
+            attestation = root / "attestation.json"
+            attestation.write_text("{}", encoding="utf-8")
+            account_tracker = outreach / "workspace" / "account_tracker.xlsx"
+            account_tracker.write_bytes(b"operator fixture")
+            review = (
+                outreach
+                / "workspace"
+                / "comms_learning"
+                / "outcome_recommendation_review_2026-07-11.json"
+            )
+            review.write_text("{}", encoding="utf-8")
+            settings = Settings(
+                data_dir=root / "data",
+                user_id="operator-user",
+                resumegen_root=resume,
+                outreach_root=outreach,
+                runtime_dir=runtime,
+                attestation_path=attestation,
+                resume_python=Path(sys.executable),
+            )
+            settings.prepare()
+            for path in (
+                runtime / "nightly_scheduler.lock",
+                runtime / "nightly_pipeline.lock",
+                resume / "discovery" / ".jobs.lock",
+                current_queue.parent / ".current_apply_queue.lock",
+            ):
+                path.write_text("", encoding="utf-8")
+
+            backend = OperatorBackend(settings)
+            commands = {
+                item["command_id"]: item
+                for item in backend.capabilities()["commands"]
+            }
+            self.assertEqual(commands["production.preflight"]["status"], "available")
+            self.assertEqual(commands["reports.daily.refresh"]["status"], "unavailable")
+            self.assertEqual(commands["reports.sources.refresh"]["status"], "unavailable")
+            self.assertEqual(commands["nightly.run"]["status"], "forbidden")
+
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=b'PRIVATE OUTPUT {"status":"valid"}\n',
+                stderr=b"",
+            )
+            with patch(
+                "recruiting_companion.operator_backend.subprocess.run",
+                return_value=completed,
+            ) as runner:
+                job = backend.submit_job(
+                    command_id="production.preflight",
+                    confirmation="RUN_PRODUCTION_PREFLIGHT",
+                    requested_scope="local",
+                )
+            self.assertEqual(job["status"], "completed")
+            self.assertEqual(job["result_code"], "preflight_valid")
+            self.assertEqual(job["returncode"], 0)
+            self.assertEqual(job["stdout_lines"], 1)
+            self.assertNotIn("PRIVATE OUTPUT", json.dumps(job))
+            argv = runner.call_args.args[0]
+            self.assertEqual(
+                argv[1:],
+                [
+                    "discovery/scripts/nightly_prompt.py",
+                    "--production-check-only",
+                    "--production-attestation",
+                    str(attestation.resolve()),
+                ],
+            )
+            self.assertEqual(runner.call_args.kwargs["cwd"], resume.resolve())
+            self.assertIs(runner.call_args.kwargs["shell"], False)
+
+            blocked = backend.submit_job(
+                command_id="nightly.run",
+                confirmation="",
+                requested_scope="web",
+            )
+            self.assertEqual(blocked["status"], "blocked")
+            self.assertEqual(blocked["result_code"], "capability_forbidden")
+            with self.assertRaises(ValidationError):
+                backend.submit_job(
+                    command_id="production.preflight",
+                    confirmation="wrong",
+                    requested_scope="local",
+                )
+            with self.assertRaises(ValidationError):
+                backend.submit_job(
+                    command_id="arbitrary.shell",
+                    confirmation="",
+                    requested_scope="local",
+                )
+
+            if Path("/usr/bin/open").is_file():
+                open_completed = subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout=b"", stderr=b""
+                )
+                with patch(
+                    "recruiting_companion.operator_backend.subprocess.run",
+                    return_value=open_completed,
+                ) as open_runner:
+                    opened = backend.submit_job(
+                        command_id="open.account_tracker",
+                        confirmation="OPEN_ACCOUNT_TRACKER",
+                        requested_scope="web",
+                    )
+                self.assertEqual(opened["status"], "completed")
+                self.assertEqual(opened["result_code"], "local_open_requested")
+                self.assertEqual(
+                    open_runner.call_args.args[0],
+                    ["/usr/bin/open", str(account_tracker.resolve())],
+                )
+                self.assertIs(open_runner.call_args.kwargs["shell"], False)
+
+                account_tracker.unlink()
+                outside = root / "outside.xlsx"
+                outside.write_bytes(b"outside")
+                account_tracker.symlink_to(outside)
+                commands = {
+                    item["command_id"]: item
+                    for item in backend.capabilities()["commands"]
+                }
+                self.assertEqual(
+                    commands["open.account_tracker"]["status"], "unavailable"
+                )
+
+            jobs = backend.list_jobs()
+            self.assertGreaterEqual(len(jobs), 2)
+            self.assertNotIn("PRIVATE OUTPUT", json.dumps(jobs))
+
+
+class GuardedOperatorActionTestCase(unittest.TestCase):
+    def test_parameter_guards_async_execution_busy_lock_and_fixed_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resume = root / "resume"
+            outreach = root / "outreach"
+            runtime = root / "runtime"
+            validation = resume / "discovery" / "source_validation"
+            validation.mkdir(parents=True)
+            (resume / "discovery" / "scripts").mkdir()
+            (resume / "apply_assist").mkdir()
+            queue_root = (
+                resume / "apps" / "Apply queues" / "current_apply_queue"
+            )
+            application_folder = queue_root / "jobs" / "one-role"
+            application_folder.mkdir(parents=True)
+            (application_folder / "jd.txt").write_text(
+                "private job description", encoding="utf-8"
+            )
+            (resume / "jobs.py").write_text("# fixed fixture\n", encoding="utf-8")
+            (resume / "apply_assist" / "build_apply_task.py").write_text(
+                "# fixed fixture\n", encoding="utf-8"
+            )
+            (resume / ".env").write_text(
+                "ANTHROPIC_API_KEY=test-model-key\n", encoding="utf-8"
+            )
+            (queue_root / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "queue_type": "current_apply_queue",
+                        "ready_count": 1,
+                        "manual_review_count": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (queue_root / "priority_order.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": 42,
+                            "company": "Example Company",
+                            "role_title": "Product Lead",
+                            "status": "queued",
+                            "queue_bucket": "new",
+                            "fit_score": 8.4,
+                            "priority_rank": 1,
+                            "folder_path": "jobs/one-role",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (outreach / "workspace").mkdir(parents=True)
+            (outreach / "main.py").write_text("# fixed fixture\n", encoding="utf-8")
+            runtime.mkdir()
+            for path in (
+                runtime / "nightly_scheduler.lock",
+                runtime / "nightly_pipeline.lock",
+                resume / "discovery" / ".jobs.lock",
+                queue_root.parent / ".current_apply_queue.lock",
+            ):
+                path.write_text("", encoding="utf-8")
+            attestation = root / "attestation.json"
+            attestation.write_text("{}", encoding="utf-8")
+            settings = Settings(
+                data_dir=root / "data",
+                user_id="guarded-actions",
+                resumegen_root=resume,
+                outreach_root=outreach,
+                runtime_dir=runtime,
+                attestation_path=attestation,
+                resume_python=Path(sys.executable),
+                outreach_python=Path(sys.executable),
+            )
+            backend = OperatorBackend(settings)
+            self.assertEqual(
+                settings.adapter_mutation_lock_path,
+                runtime / "operator_mutation.lock",
+            )
+            self.assertTrue(settings.adapter_mutation_lock_path.is_file())
+
+            commands = {
+                item["command_id"]: item
+                for item in backend.capabilities()["commands"]
+            }
+            resume_command = commands["application.resume.generate"]
+            self.assertEqual(resume_command["status"], "available")
+            self.assertTrue(resume_command["asynchronous"])
+            self.assertEqual(
+                resume_command["parameters_schema"]["required"], ["job_id"]
+            )
+            self.assertEqual(
+                resume_command["confirmation_phrase"],
+                "GENERATE_ONE_RESUME_WITH_MODEL_COST",
+            )
+            with settings.adapter_mutation_lock_path.open("r+b") as shared_lock:
+                fcntl.flock(
+                    shared_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+                shared_status = backend.adapter.status()
+                self.assertEqual(
+                    shared_status["locks"]["adapter_mutation"], "busy"
+                )
+                shared_commands = {
+                    item["command_id"]: item
+                    for item in backend.capabilities()["commands"]
+                }
+                self.assertEqual(
+                    shared_commands["application.resume.generate"]["status"],
+                    "unavailable",
+                )
+                fcntl.flock(shared_lock.fileno(), fcntl.LOCK_UN)
+
+            queue_lock_path = queue_root.parent / ".current_apply_queue.lock"
+            with queue_lock_path.open("r+b") as queue_lock:
+                fcntl.flock(
+                    queue_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+                queue_locked_status = backend.adapter.status()
+                self.assertEqual(
+                    queue_locked_status["locks"]["queue"], "busy"
+                )
+                queue_locked_assets = backend.assets()
+                self.assertIn(
+                    queue_locked_assets["current_apply_queue"]["status"],
+                    {"busy", "unavailable"},
+                )
+                self.assertEqual(
+                    queue_locked_assets["current_apply_queue"]["items"], []
+                )
+                queue_locked_commands = {
+                    item["command_id"]: item
+                    for item in backend.capabilities()["commands"]
+                }
+                self.assertEqual(
+                    queue_locked_commands["application.apply_packet.build"][
+                        "status"
+                    ],
+                    "unavailable",
+                )
+                blocked_by_queue = backend.submit_job(
+                    command_id="application.apply_packet.build",
+                    confirmation="BUILD_ONE_APPLY_PACKET",
+                    parameters={"job_id": 42},
+                    requested_scope="web",
+                )
+                self.assertEqual(blocked_by_queue["status"], "blocked")
+                self.assertEqual(
+                    blocked_by_queue["result_code"],
+                    "capability_unavailable",
+                )
+                fcntl.flock(queue_lock.fileno(), fcntl.LOCK_UN)
+
+            assets = backend.assets()
+            queue_action_states = {
+                item["command_id"]: item
+                for item in assets["current_apply_queue"]["items"][0]["actions"]
+            }
+            self.assertEqual(
+                queue_action_states["application.resume.generate"]["status"],
+                "available",
+            )
+            self.assertEqual(
+                queue_action_states["application.resume.generate"]["parameters"],
+                {"job_id": 42},
+            )
+
+            with self.assertRaises(ValidationError):
+                backend.submit_job(
+                    command_id="application.resume.generate",
+                    confirmation="GENERATE_ONE_RESUME_WITH_MODEL_COST",
+                    parameters={"job_id": 42, "flags": "--force"},
+                    requested_scope="web",
+                )
+            with self.assertRaises(ValidationError):
+                backend.submit_job(
+                    command_id="application.resume.generate",
+                    confirmation="GENERATE_ONE_RESUME_WITH_MODEL_COST",
+                    parameters={"job_id": "42"},
+                    requested_scope="web",
+                )
+            with self.assertRaises(ValidationError):
+                backend.submit_job(
+                    command_id="application.resume.generate",
+                    confirmation="wrong",
+                    parameters={"job_id": 42},
+                    requested_scope="web",
+                )
+            with self.assertRaisesRegex(ValidationError, "not present"):
+                backend.submit_job(
+                    command_id="application.apply_packet.build",
+                    confirmation="BUILD_ONE_APPLY_PACKET",
+                    parameters={"job_id": 999},
+                    requested_scope="local",
+                )
+
+            started = threading.Event()
+            release = threading.Event()
+
+            def delayed_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+                started.set()
+                release.wait(timeout=3)
+                return subprocess.CompletedProcess(
+                    args=args[0],
+                    returncode=0,
+                    stdout=b"PRIVATE MODEL OUTPUT\n",
+                    stderr=b"",
+                )
+
+            with patch(
+                "recruiting_companion.operator_backend.subprocess.run",
+                side_effect=delayed_run,
+            ) as runner:
+                before = time.monotonic()
+                queued = backend.submit_job(
+                    command_id="application.resume.generate",
+                    confirmation="GENERATE_ONE_RESUME_WITH_MODEL_COST",
+                    parameters={"job_id": 42},
+                    requested_scope="web",
+                )
+                elapsed = time.monotonic() - before
+                self.assertLess(elapsed, 1.0)
+                self.assertIn(queued["status"], {"queued", "running"})
+                self.assertTrue(started.wait(timeout=2))
+                running = backend.get_job(queued["id"])
+                self.assertEqual(running["status"], "running")
+                argv = runner.call_args.args[0]
+                self.assertEqual(
+                    argv[1:],
+                    [
+                        "jobs.py",
+                        "--no-color",
+                        "generate",
+                        "--id",
+                        "42",
+                        "--resume-only",
+                        "--budget-mode",
+                        "--parallel",
+                        "1",
+                        "--timeout",
+                        "2400",
+                        "--model",
+                        "claude-sonnet-4-6",
+                    ],
+                )
+                self.assertNotIn("--force", argv)
+                self.assertNotIn("--with-cl", argv)
+                self.assertIs(runner.call_args.kwargs["shell"], False)
+                self.assertEqual(
+                    runner.call_args.kwargs["cwd"], resume.resolve()
+                )
+                release.set()
+                completed = self._wait_for_job(backend, queued["id"])
+            self.assertEqual(completed["status"], "completed")
+            self.assertEqual(
+                completed["result_code"], "resume_generation_completed"
+            )
+            self.assertEqual(completed["parameters"], {"job_id": 42})
+            self.assertNotIn("PRIVATE MODEL OUTPUT", json.dumps(completed))
+
+            with (runtime / "nightly_scheduler.lock").open("r+b") as lock_handle:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                blocked = backend.submit_job(
+                    command_id="application.apply_packet.build",
+                    confirmation="BUILD_ONE_APPLY_PACKET",
+                    parameters={"job_id": 42},
+                    requested_scope="local",
+                )
+                self.assertEqual(blocked["status"], "blocked")
+                self.assertEqual(
+                    blocked["result_code"], "capability_unavailable"
+                )
+                with patch.object(
+                    backend,
+                    "capabilities",
+                    return_value={
+                        "commands": [
+                            {
+                                "command_id": "accounts.refresh",
+                                "status": "available",
+                            }
+                        ]
+                    },
+                ):
+                    raced = backend.submit_job(
+                        command_id="accounts.refresh",
+                        confirmation="REFRESH_ACCOUNT_TRACKER",
+                        parameters={},
+                        requested_scope="local",
+                    )
+                raced = self._wait_for_job(backend, raced["id"])
+                self.assertEqual(raced["status"], "blocked")
+                self.assertEqual(
+                    raced["result_code"], "engine_locks_not_free"
+                )
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+            if Path("/usr/bin/open").is_file():
+                opened_process = subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout=b"", stderr=b""
+                )
+                with patch(
+                    "recruiting_companion.operator_backend.subprocess.run",
+                    return_value=opened_process,
+                ) as open_runner:
+                    opened = backend.submit_job(
+                        command_id="open.application_folder",
+                        confirmation="OPEN_APPLICATION_FOLDER",
+                        parameters={"job_id": 42},
+                        requested_scope="web",
+                    )
+                self.assertEqual(opened["status"], "completed")
+                self.assertEqual(
+                    open_runner.call_args.args[0],
+                    ["/usr/bin/open", str(application_folder.resolve())],
+                )
+
+            summary_path = validation / "20260711-120000-nightly-pipeline-summary.json"
+            source_path = validation / "20260711-120000-source-run-metrics.json"
+            summary_path.write_text(
+                json.dumps({"created_at": "2026-07-11T12:00:00Z"}),
+                encoding="utf-8",
+            )
+            source_path.write_text("{}", encoding="utf-8")
+            verified = {
+                "run_id": "20260711-120000",
+                "started_at": "2026-07-11T12:00:00+00:00",
+                "evidence": {
+                    "summary": {
+                        "path": summary_path.relative_to(resume).as_posix()
+                    },
+                    "source_metrics": {
+                        "path": source_path.relative_to(resume).as_posix()
+                    },
+                },
+            }
+            with patch.object(
+                backend.adapter,
+                "verified_run_projections",
+                return_value=[verified],
+            ):
+                daily_argv, daily_cwd, _, _ = backend._fixed_action_argv(
+                    "reports.daily.refresh", {}
+                )
+                self.assertEqual(
+                    daily_argv[1:],
+                    [
+                        "main.py",
+                        "write-daily-run-report",
+                        "--workspace",
+                        "workspace",
+                        "--since",
+                        "2026-07-11T12:00:00Z",
+                        "--nightly-summary",
+                        str(summary_path.resolve()),
+                        "--run-id",
+                        "20260711-120000",
+                    ],
+                )
+                self.assertEqual(daily_cwd, outreach.resolve())
+                source_argv, _, _, _ = backend._fixed_action_argv(
+                    "reports.sources.refresh", {}
+                )
+                self.assertEqual(
+                    source_argv[1:],
+                    [
+                        "main.py",
+                        "build-role-surface-report",
+                        "--source-metrics",
+                        str(source_path.resolve()),
+                        "--run-id",
+                        "20260711-120000",
+                        "--workspace",
+                        "workspace",
+                    ],
+                )
+
+            plan_argv, _, _, _ = backend._fixed_action_argv(
+                "outreach.plan.preview", {}
+            )
+            self.assertIn("build-track-2-daily-plan", plan_argv)
+            self.assertNotIn("--execute", plan_argv)
+            self.assertNotIn("--send-linkedin", plan_argv)
+            account_argv, _, _, _ = backend._fixed_action_argv(
+                "accounts.refresh", {}
+            )
+            self.assertEqual(
+                account_argv[1:],
+                [
+                    "main.py",
+                    "account-tracker",
+                    "--workspace",
+                    "workspace",
+                    "--output",
+                    "workspace/account_tracker.xlsx",
+                ],
+            )
+            cadence_argv, _, _, _ = backend._fixed_action_argv(
+                "reports.cadence.refresh", {}
+            )
+            self.assertEqual(
+                cadence_argv[1:],
+                [
+                    "main.py",
+                    "build-outreach-cadence-report",
+                    "--workspace",
+                    "workspace",
+                ],
+            )
+            outcome_argv, _, _, _ = backend._fixed_action_argv(
+                "reports.outcomes.refresh", {}
+            )
+            self.assertEqual(
+                outcome_argv[1:],
+                [
+                    "main.py",
+                    "build-outcome-learning-report",
+                    "--workspace",
+                    "workspace",
+                ],
+            )
+            lab_argv, _, _, _ = backend._fixed_action_argv(
+                "communications.lab.refresh", {}
+            )
+            self.assertEqual(
+                lab_argv[1:],
+                [
+                    "main.py",
+                    "build-communication-lab",
+                    "--workspace",
+                    "workspace",
+                    "--resume-root",
+                    str(resume.resolve()),
+                ],
+            )
+            packet_argv, _, _, _ = backend._fixed_action_argv(
+                "application.apply_packet.build", {"job_id": 42}
+            )
+            self.assertEqual(
+                packet_argv[1:],
+                [
+                    "apply_assist/build_apply_task.py",
+                    "--job-id",
+                    "42",
+                    "--queue-json",
+                    "apps/Apply queues/current_apply_queue/priority_order.json",
+                    "--out-dir",
+                    "apply_assist/tasks",
+                ],
+            )
+            self.assertNotIn("rtrvr_apply_runner.py", packet_argv)
+            self.assertNotIn("--live", packet_argv)
+
+    @staticmethod
+    def _wait_for_job(
+        backend: OperatorBackend,
+        job_id: str,
+        *,
+        timeout: float = 3.0,
+    ) -> dict[str, object]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            job = backend.get_job(job_id)
+            if job["status"] in {"completed", "failed", "blocked"}:
+                return job
+            time.sleep(0.01)
+        raise AssertionError("operator background job did not finish")
 
 
 class ExistingAdapterTestCase(unittest.TestCase):
@@ -911,6 +1691,7 @@ class ExistingAdapterTestCase(unittest.TestCase):
                 json.dumps(
                     {
                         "report_mode": "run_scoped",
+                        "run_id": run_id,
                         "nightly_summary": str(summary_path),
                         "since": "2026-07-11T12:00:00Z",
                         "source_breakdown": [],
@@ -957,13 +1738,23 @@ class ExistingAdapterTestCase(unittest.TestCase):
                 resume / "apps" / "Apply queues" / "current_apply_queue"
             )
             queue_root.mkdir(parents=True)
+            material_folder = queue_root / "jobs" / "demo-role"
+            material_folder.mkdir(parents=True)
+            for filename in (
+                "resume_2026-07-11.docx",
+                "cl_2026-07-11.docx",
+                "jd.txt",
+                "strategy.json",
+                "intel.txt",
+            ):
+                (material_folder / filename).write_text("fixture", encoding="utf-8")
             (queue_root / "manifest.json").write_text(
                 json.dumps(
                     {
                         "created_at": "2026-07-11T13:00:00Z",
                         "queue_type": "current_apply_queue",
                         "sources": ["generic_import"],
-                        "ready_count": 1,
+                        "ready_count": 105,
                         "manual_review_count": 1,
                     }
                 ),
@@ -974,13 +1765,19 @@ class ExistingAdapterTestCase(unittest.TestCase):
                 json.dumps(
                     [
                         {
-                            "company": private_marker,
-                            "role_title": private_marker,
+                            "id": f"job-{index + 1}",
+                            "company": f"Example Company {index + 1}",
+                            "role_title": "Product Manager",
                             "url": f"https://example.test/{private_marker}",
+                            "fit_score": 8.4,
+                            "priority_score": 91.2,
+                            "priority_rank": index + 1,
                             "status": "queued",
                             "queue_bucket": "new",
                             "in_latest_run": True,
+                            "folder_path": "jobs/demo-role",
                         }
+                        for index in range(105)
                     ]
                 ),
                 encoding="utf-8",
@@ -1009,6 +1806,7 @@ class ExistingAdapterTestCase(unittest.TestCase):
                     "scheduler": "unavailable",
                     "pipeline": "unavailable",
                     "workbook": "unavailable",
+                    "queue": "unavailable",
                     "adapter_mutation": "free",
                 },
             )
@@ -1017,8 +1815,113 @@ class ExistingAdapterTestCase(unittest.TestCase):
                 runtime / "nightly_scheduler.lock",
                 runtime / "nightly_pipeline.lock",
                 resume / "discovery" / ".jobs.lock",
+                queue_root.parent / ".current_apply_queue.lock",
             ):
                 lock_path.write_text("", encoding="utf-8")
+
+            _write_minimal_xlsx(
+                resume / "discovery" / "jobs.xlsx",
+                {
+                    "Jobs": [
+                        ["id", "status", "source", "role_type", "fit_score", "company"],
+                        ["1", "applied", "linkedin", "PM", "8.5", private_marker],
+                        ["2", "queued", "manual", "Strategy", "7.2", private_marker],
+                    ],
+                    "Archive": [
+                        ["id", "status", "source", "role_type"],
+                        ["3", "skipped", "indeed", "Other"],
+                    ],
+                    "ReviewCache": [
+                        ["cache_key", "source", "decision", "category", "company"],
+                        ["cache-1", "jobspy_filtered_v1", "Reject", "N/A", private_marker],
+                    ],
+                },
+            )
+            _write_minimal_xlsx(
+                outreach_workspace / "account_tracker.xlsx",
+                {
+                    "Account Tracker": [
+                        [
+                            "Company",
+                            "Tier",
+                            "Account Stage",
+                            "Account Score",
+                            "Fit Score",
+                            "People Mapped",
+                            "Invites Sent",
+                            "Accepted",
+                            "Replies",
+                            "Contact Name",
+                        ],
+                        [
+                            "Example Account",
+                            "A",
+                            "outreach_active",
+                            "85",
+                            "8",
+                            "3",
+                            "2",
+                            "1",
+                            "1",
+                            private_marker,
+                        ],
+                    ],
+                    "Action Queue": [
+                        ["Company", "Next Action", "Next Due", "Contact Name"],
+                        *[
+                            [
+                                (
+                                    "Example Account"
+                                    if index == 0
+                                    else f"Action Account {index + 1}"
+                                ),
+                                "Map contacts on LinkedIn",
+                                "2026-07-14",
+                                private_marker,
+                            ]
+                            for index in range(55)
+                        ],
+                    ],
+                },
+            )
+            story_dir = resume / "docs" / "career_workbench" / "story_engine"
+            story_dir.mkdir(parents=True)
+            (story_dir / "private-story-name.md").write_text(
+                private_marker, encoding="utf-8"
+            )
+            canonical_story_dir = story_dir / "stories"
+            canonical_story_dir.mkdir()
+            (canonical_story_dir / "product_iteration.md").write_text(
+                private_marker, encoding="utf-8"
+            )
+            comms_dir = outreach_workspace / "comms_learning"
+            comms_dir.mkdir()
+            (comms_dir / "outcome_learning.json").write_text(
+                json.dumps(
+                    {
+                        "totals": {
+                            "sends": 10,
+                            "accepts": 2,
+                            "replies": 1,
+                            "gold": 1,
+                            "silver": 9,
+                            "negative": 0,
+                        },
+                        "private": private_marker,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (comms_dir / "outcome_recommendation_review_2026-07-11.json").write_text(
+                json.dumps(
+                    {
+                        "automatic_prompt_changes_applied": False,
+                        "policy_changes_applied": False,
+                        "private": private_marker,
+                    }
+                ),
+                encoding="utf-8",
+            )
             snapshot = ExistingEngineAdapter(settings).snapshot()
             self.assertEqual(snapshot["run_snapshot"]["run_id"], run_id)
             queue = snapshot["run_snapshot"]["queue"]
@@ -1043,13 +1946,108 @@ class ExistingAdapterTestCase(unittest.TestCase):
                 snapshot["current_workspace"]["application_queue"][
                     "priority_item_count"
                 ],
-                1,
+                105,
             )
             self.assertEqual(
                 snapshot["current_workspace"]["outreach_counts"]["contacts"],
                 1,
             )
+            self.assertEqual(
+                snapshot["current_workspace"]["application_queue"][
+                    "material_flags"
+                ],
+                {
+                    "folders_resolved": 105,
+                    "resume_ready": 105,
+                    "cover_letter_ready": 105,
+                    "job_description_ready": 105,
+                    "strategy_ready": 105,
+                    "intel_ready": 105,
+                },
+            )
             self.assertNotIn(private_marker, json.dumps(snapshot))
+
+            operator = OperatorBackend(settings)
+            assets = operator.assets()
+            self.assertEqual(assets["workbooks"]["status"], "available")
+            self.assertEqual(
+                assets["workbooks"]["resume_workbook"]["jobs"]["row_count"],
+                2,
+            )
+            self.assertEqual(
+                assets["workbooks"]["account_tracker"]["account_count"], 1
+            )
+            self.assertEqual(
+                assets["workbooks"]["account_tracker"]["sheet_row_counts"][
+                    "Action Queue"
+                ],
+                55,
+            )
+            self.assertEqual(
+                assets["current_apply_queue"]["summary"]["material_flags"][
+                    "resume_ready"
+                ],
+                105,
+            )
+            self.assertEqual(
+                assets["current_apply_queue"]["items"][0]["company"],
+                "Example Company 1",
+            )
+            self.assertEqual(
+                assets["current_apply_queue"]["items_returned"], 100
+            )
+            self.assertEqual(assets["current_apply_queue"]["items_total"], 105)
+            self.assertTrue(assets["current_apply_queue"]["truncated"])
+            self.assertTrue(
+                assets["current_apply_queue"]["items"][0]["has_resume"]
+            )
+            account_actions = assets["workbooks"]["account_tracker"][
+                "action_items"
+            ]
+            self.assertEqual(account_actions[0]["company"], "Example Account")
+            self.assertEqual(
+                account_actions[0]["next_action"], "Map contacts on LinkedIn"
+            )
+            self.assertEqual(len(account_actions), 50)
+            self.assertEqual(
+                assets["workbooks"]["account_tracker"]["action_items_total"],
+                55,
+            )
+            self.assertTrue(
+                assets["workbooks"]["account_tracker"][
+                    "action_items_truncated"
+                ]
+            )
+            self.assertEqual(
+                assets["story_comms"]["stories"]["items"][0]["filename"],
+                "product_iteration.md",
+            )
+            self.assertEqual(
+                assets["story_comms"]["outcome_totals"]["sends"], 10
+            )
+            self.assertEqual(assets["daily_reports"]["count"], 1)
+            self.assertEqual(
+                assets["source_metrics"]["latest"]["run_id"], run_id
+            )
+            self.assertNotIn(private_marker, json.dumps(assets))
+            overview = operator.overview()
+            self.assertIn("assets", overview)
+            self.assertIn("capabilities", overview)
+            self.assertEqual(overview["recent_jobs"], [])
+
+            mismatched_report = json.loads(report_path.read_text(encoding="utf-8"))
+            mismatched_report["run_id"] = "20260711-120001"
+            report_path.write_text(
+                json.dumps(mismatched_report), encoding="utf-8"
+            )
+            rejected = ExistingEngineAdapter(settings).status()
+            self.assertEqual(rejected["verified_run_count"], 0)
+            self.assertTrue(
+                any(
+                    "report run_id does not match" in reason
+                    for reason in rejected["rejections"]
+                )
+            )
 
 
 if __name__ == "__main__":

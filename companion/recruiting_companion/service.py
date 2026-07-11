@@ -287,7 +287,9 @@ class CompanionService:
                 "SELECT data_json FROM preferences WHERE user_id = ?",
                 (self.settings.user_id,),
             ).fetchone()
-        return _loads(row["data_json"], {}) if row else {}
+        if row:
+            return _loads(row["data_json"], {})
+        return {"mode": self.settings.default_mode}
 
     def put_preferences(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, dict):

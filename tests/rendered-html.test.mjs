@@ -77,6 +77,18 @@ test("server-renders the working command center and all human gates", async () =
   assert.doesNotMatch(html, /auto-send/i);
 });
 
+test("server-renders the private operator cockpit routes without private data", async () => {
+  for (const path of ["/app/accounts", "/app/stories", "/app/operations"]) {
+    const response = await render(path);
+    assert.equal(response.status, 200);
+    const html = await response.text();
+    assert.match(html, /Private operator mode/);
+    assert.match(html, /Pair the local companion/);
+    assert.match(html, /Connect this Mac/);
+    assert.doesNotMatch(html, /\/Users\/|@gmail\.com|linkedin\.com\/in\//i);
+  }
+});
+
 test("server-renders private first-run onboarding", async () => {
   const response = await render("/app/onboarding");
   assert.equal(response.status, 200);

@@ -39,6 +39,8 @@ next-env.d.ts
 *.tsbuildinfo
 /dist/
 /static-export/
+/static-export.staged/
+/.static-export.*
 /.wrangler/
 /outputs/
 /work/

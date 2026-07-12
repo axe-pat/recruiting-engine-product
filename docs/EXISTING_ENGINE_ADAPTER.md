@@ -8,6 +8,13 @@ engine's discovery, scoring, review, generation, or delivery logic. It exposes
 normalized status and run evidence while keeping private operating data on the
 user's machine.
 
+The current single-user product serves its primary UI and API from the same
+loopback companion at `http://127.0.0.1:8765/app/`. The adapter remains the
+source-normalization layer; the separate operator backend owns fixed mutations,
+review/approval, audits, progress/plan projections, and desktop-open actions.
+The hosted build continues to use the same minimized adapter contracts after an
+explicit pairing exchange.
+
 This document defines the public integration contract. It intentionally contains
 no production artifact payloads, contacts, messages, credentials, browser state,
 or machine-specific paths.
@@ -46,6 +53,9 @@ Application/resume engine:
 - `discovery/.jobs.lock`
 - `apps/Apply queues/current_apply_queue/manifest.json`
 - `apps/Apply queues/current_apply_queue/priority_order.json`
+- allowlisted, timestamped active-run logs and LinkedIn aggregate
+  progress/scoring artifacts used only while the exact scheduler/pipeline
+  attempt is active
 
 Outreach engine:
 
@@ -83,10 +93,10 @@ argument vector, never through a shell. It validates repository access, protecte
 code cleanliness, tested revisions, and attested test evidence. It does not read
 or mutate scheduler due-state and cannot start the pipeline.
 
-## Zero-mutation allowlist
+## Core zero-mutation allowlist
 
-The public adapter surface is deny-by-default. Version 1 may perform only these
-operations without a separate human authorization flow:
+The adapter's read-first core is deny-by-default. These operations require no
+separate human authorization flow:
 
 | Command ID | Behavior |
 |---|---|
@@ -103,27 +113,36 @@ credentials, environment values, or arbitrary file contents.
 
 Report builders, queue builders, workbook exports, and source captures are not
 zero-mutation operations: even when they do not send externally, they write local
-artifacts or use browser/network state. They belong behind a separate restricted
-policy if added later.
+artifacts or use browser/network state. The current product exposes only a named,
+fixed-argument subset through the reviewed operator backend described in
+[OPERATOR_COCKPIT.md](OPERATOR_COCKPIT.md). They are not added to this raw
+adapter allowlist.
 
-## Human-gated non-allowlist
+## Human-gated operator boundary
 
-The following are not part of the public allowlist:
+The following remain forbidden to the raw adapter and to caller-supplied command
+input:
 
 - an arbitrary command, path, environment override, or CLI flag;
-- a forced nightly run or a direct Daily Engine/pipeline invocation;
+- a forced nightly run or direct Daily Engine/pipeline invocation outside the
+  exact reviewed `nightly.run` contract;
 - any flag containing `--execute`, `--execute-sends`, `--send-linkedin`,
   `--generate`, `--force`, or `--promote-approved`;
-- LinkedIn invites, follow-ups, inbox replies, or other browser delivery;
-- SMTP delivery, even when a draft exists;
+- unreviewed, multi-target, or caller-defined LinkedIn invites, follow-ups,
+  inbox replies, or other browser delivery;
+- unreviewed or caller-defined SMTP delivery, even when a draft exists;
 - live browser capture, account mapping, or contact-information research;
-- relationship imports, company promotion, or tracker status changes;
+- relationship imports, company promotion, or blind tracker status changes;
 - disabling the Track 2 outer timeout;
 - automatic retry after a timeout or an uncertain delivery result.
 
-A future privileged action API must use named server-owned commands, bounded
-limits, an explicit confirmation token, a valid production preflight, and the
-lock discipline below. It must never accept raw shell input.
+The implemented privileged operator API uses named server-owned commands,
+bounded limits, exact review and approval where consequential, an explicit typed
+confirmation, a valid production preflight, and the lock discipline below. It
+never accepts raw shell input. The reviewed production nightly is bound to the
+canonical upstream argument vector and can include bounded application-queue and
+Track 2 LinkedIn delivery; email remains separately recipient-reviewed. Final
+application submission remains outside the cockpit.
 
 Email delivery has an additional content-bound gate: the exact recipient,
 subject, and body must be approved in a review artifact; the approval must be
@@ -149,19 +168,53 @@ determine whether another process owns the lock.
    must therefore hold one companion-owned mutation lock for every future
    operation that could write either engine.
 
-Completed, immutable run artifacts may be read while a new run is active. A live
-workspace CSV snapshot must wait until the scheduler, pipeline, workbook, and
-adapter mutation locks are free. If they are not, return the last run-scoped
-report and mark the current snapshot `busy`.
+Completed, immutable run artifacts may be read while a new run is active. The
+dedicated active-progress projection may also read only the exact scheduler
+attempt, timestamped run-log prefix, active-run manifest/action pointer, and
+allowlisted aggregate progress/scoring artifacts while the scheduler and
+pipeline locks prove that attempt is active. A live workspace CSV snapshot must
+wait until the scheduler, pipeline, workbook, current-queue, and adapter mutation
+locks are free. If they are not, return the last run-scoped report, mark mutable
+workspace projections `busy`, and keep active progress separate.
 
 An exit code of zero from a scheduler check is not proof that a run happened; it
 may mean not due or already attempted. Run success comes only from the evidence
 contract in [RUN_EVIDENCE_CONTRACT.md](RUN_EVIDENCE_CONTRACT.md).
 
+The exact action-queue pointer is also a structural verification boundary. Each
+of `application_plus_outreach`, `application_only`, `outreach_only_today`,
+`relationship_buffer`, `follow_up`, and `skipped_internal` must be an array of
+objects, and the matching value under `counts` must be a non-negative integer
+equal to that array's length. The adapter derives `decision_total_parts` and
+`decision_total` from the validated lengths and labels the total
+`validated_action_queue_lane_entries`. It does not infer cross-lane identity
+exclusivity. Any missing, malformed, or contradictory lane rejects the terminal
+run; active progress simply omits the invalid action-queue projection.
+
 ## Normalized local API
 
-The companion should bind to loopback by default and authenticate every request.
-The hosted product receives aggregates and status, not direct filesystem access.
+The companion binds to loopback by default and authenticates every protected
+request. The canonical UI is served from the same origin and uses a host-only,
+restart-stable HttpOnly local cookie plus an explicit same-origin request header;
+it does not repeatedly pair or expose the local bearer to JavaScript. Hosted
+clients use an expiring web bearer after one-time pairing. Both receive
+aggregates and status, not direct filesystem access.
+
+The implemented routes are rooted at `/api/v1`, including:
+
+- `GET /api/v1/local-ui/bootstrap` for guarded, cookie-authenticated local UI
+  bootstrap and safe server detection;
+- `GET /api/v1/existing-engine/status` and `/snapshot` for normalized state;
+- `GET /api/v1/operator/overview` for capabilities, assets, reviews, jobs,
+  progress, the next-run plan, and the account-tracker surface;
+- `GET /api/v1/operator/progress` for lightweight high-frequency exact-run and
+  recent-job polling without building the full overview;
+- `GET /api/v1/operator/reports/<run-id>/html` for one verified exact report;
+- fixed `/api/v1/operator/jobs` and `/api/v1/operator/reviews` workflows for the
+  named operator contracts.
+
+The abbreviated `/v1/...` objects below describe the adapter's normalized
+conceptual schema; the HTTP implementation uses the `/api/v1/...` prefix.
 
 ### `GET /v1/engine/capabilities`
 
@@ -239,6 +292,77 @@ tokens and hashes.
 
 Run-scoped and current-snapshot values must remain separate in the response and
 the UI. Current aliases must never overwrite historical run evidence.
+
+## Primary operator projections
+
+`GET /api/v1/operator/overview` returns operator assets schema `1.1`. Three
+projections make the local UI usable as the primary operating surface without
+weakening evidence boundaries.
+
+### Current run progress
+
+`current_run_progress` selects an active run only when the pipeline lock is
+owned and the scheduler lock plus scheduler attempt state bind one exact run ID.
+It may then project:
+
+- a phase inferred from an append-only snapshot of that run's timestamped log;
+- allowlisted search-complete and extracted totals from a same-window LinkedIn
+  progress checkpoint;
+- scoring attempted/error/accepted totals from the exact scored-artifact pointer
+  in the active log;
+- source-family and action-queue aggregates from an exact active-run manifest;
+- hashes, sizes, and repository-relative evidence tokens for those minimized
+  inputs.
+
+It never returns raw log text, search terms, job cards, URLs, message content, or
+the private upstream browser-owner marker. If lock ownership changes during
+capture, current evidence is discarded and the result is `partial`. When idle,
+the lightweight progress endpoint checks terminal summary candidates
+newest-first and stops at the first fully verified projection. It does not call
+the complete history scan on each poll; the full overview/history may still scan
+all runs.
+
+If scheduler state proves that a newer completed actual-pipeline attempt exists
+but its exact summary, manifest, source/action pointers, and Outreach report do
+not verify, `current_run_progress` returns that exact attempt as noncurrent
+`attention` instead of showing the previous run forever. Its scheduler evidence
+is restricted to a derived run ID, bounded start/completion/capture timestamps,
+and a generic missing-chain or nonzero-exit reason. Raw scheduler status details,
+paths, and rejection text are not projected.
+
+The upstream engine owns its dedicated LinkedIn Chrome process through a
+per-run marker and terminal cleanup. The adapter does not scan arbitrary Chrome
+windows or equate a visible Playwright process with a run. A LinkedIn phase is
+reported only from the exact active-run evidence above.
+
+### Next-run plan
+
+`next_run_plan` is a maximum-30-row, `scope: derived-plan` projection. Its basis
+is the latest fully verified terminal run plus the current durable operator
+review ledger. It prioritizes explicit failed/timed-out/not-reported sources,
+then exact action-queue lanes and pending/reviewed/approved review work. Every
+item carries a category, priority, reason, count, basis run, and evidence binding.
+
+While a newer run is active the plan status is `partial`, and its reason states
+that the prior exact run remains the basis. It rebases only when the new summary,
+manifest, source metrics, action queue, and Outreach report verify. It does not
+write a task table or invent recommendations from mutable current files.
+
+### Account tracker
+
+`account_tracker` is a nontransactional `stable-at-capture` aggregate. The
+companion timestamps and fingerprints inputs, probes all five locks before and
+after, and revalidates every bounded identity/hash without ever owning an
+upstream lock; this prevents a UI read from breaking nonblocking production
+writers. Any change discards the entire mutable bundle. It may contain account/action/due counts, allowlisted
+tier/stage/action-type mappings, activity totals, people-mapped count, score
+summaries, and evidence metadata. The existing bounded Action Queue rows remain
+under the workbook projection.
+
+Its `open_action` advertises the fixed `open.account_tracker` capability,
+confirmation phrase, and availability. The companion resolves the server-owned
+allowlisted workbook path and calls the platform opener; the HTTP client cannot
+provide a path. A busy or unsafe workbook fails closed.
 
 ## Snapshot source schemas
 

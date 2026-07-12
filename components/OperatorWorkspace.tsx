@@ -21,6 +21,7 @@ export type OperatorView =
   | "sources"
   | "queue"
   | "runs"
+  | "plan"
   | "applications"
   | "outreach"
   | "reports"
@@ -198,6 +199,11 @@ const viewCopy: Record<OperatorView, { eyebrow: string; title: string; body: str
     title: "Completed runs, bound to exact artifacts.",
     body: "Only nightly runs that pass the summary, manifest, source-metrics, queue, and report evidence chain appear here.",
   },
+  plan: {
+    eyebrow: "Grounded next-run plan",
+    title: "What the next cycle should do—and why.",
+    body: "A prioritized plan derived from the latest exact run, source failures, review backlog, and live queue state. Every recommendation retains its evidence binding.",
+  },
   applications: {
     eyebrow: "Application history",
     title: "Live tracker state without exposing raw rows.",
@@ -266,6 +272,9 @@ export function OperatorWorkspace({
   const storyComms = asRecord(assets.story_comms);
   const reports = asRecord(assets.daily_reports);
   const sources = asRecord(assets.source_metrics);
+  const currentRunProgress = asRecord(assets.current_run_progress);
+  const nextRunPlan = asRecord(assets.next_run_plan);
+  const accountTracker = asRecord(assets.account_tracker);
   const commands = normalizeCommands(overview?.capabilities?.commands ?? []);
   const reviewLanes = useMemo(() => overview?.review_queue?.lanes ?? [], [overview?.review_queue?.lanes]);
   const recentReviews = useMemo(() => overview?.review_queue?.recent_reviews ?? [], [overview?.review_queue?.recent_reviews]);
@@ -483,14 +492,15 @@ export function OperatorWorkspace({
 
       {actionMessage ? <div className="operator-action-message" role="status">{actionMessage}</div> : null}
 
-      {view === "dashboard" ? <OperatorDashboard overview={overview} workbooks={workbooks} queue={queue} storyComms={storyComms} reports={reports} commands={commands} onSelect={selectCommand} /> : null}
-      {view === "accounts" ? <AccountsSurface workbooks={workbooks} commands={commands} onSelect={selectCommand} /> : null}
+      {view === "dashboard" ? <OperatorDashboard overview={overview} workbooks={workbooks} queue={queue} storyComms={storyComms} reports={reports} progress={currentRunProgress} commands={commands} onSelect={selectCommand} /> : null}
+      {view === "accounts" ? <AccountsSurface workbooks={workbooks} accountTracker={accountTracker} commands={commands} onSelect={selectCommand} /> : null}
       {view === "queue" ? <ApplyQueueSurface queue={queue} items={items} commands={commands} onSelect={selectCommand} /> : null}
       {view === "applications" ? <ApplicationHistorySurface workbooks={workbooks} commands={commands} onSelect={selectCommand} /> : null}
       {view === "stories" ? <StorySurface storyComms={storyComms} commands={commands} onSelect={selectCommand} /> : null}
       {view === "outreach" ? <CommunicationSurface storyComms={storyComms} commands={commands} onSelect={selectCommand} /> : null}
       {view === "reports" || view === "sources" ? <ReportSurface reports={reports} sources={sources} commands={commands} onSelect={selectCommand} onOpenReport={openExactReport} reportLoadingRunId={reportLoadingRunId} showSources={view === "sources"} /> : null}
-      {view === "runs" ? <VerifiedRunsSurface reports={reports} sources={sources} commands={commands} onSelect={selectCommand} onOpenReport={openExactReport} reportLoadingRunId={reportLoadingRunId} /> : null}
+      {view === "runs" ? <VerifiedRunsSurface reports={reports} sources={sources} progress={currentRunProgress} commands={commands} onSelect={selectCommand} onOpenReport={openExactReport} reportLoadingRunId={reportLoadingRunId} /> : null}
+      {view === "plan" ? <NextRunPlanSurface plan={nextRunPlan} progress={currentRunProgress} commands={commands} onSelect={selectCommand} /> : null}
       {view === "operations" ? <OperationsSurface overview={overview} commands={commands} onSelect={selectCommand} /> : null}
 
       {(view === "reports" || view === "runs") && reportDocument ? <ExactReportViewer report={reportDocument} onClose={() => setReportDocument(null)} /> : null}
@@ -584,7 +594,7 @@ function OperatorGuard({ overview }: { overview: OperatorOverview }) {
   );
 }
 
-function OperatorDashboard({ overview, workbooks, queue, storyComms, reports, commands, onSelect }: { overview: OperatorOverview; workbooks: UnknownRecord; queue: UnknownRecord; storyComms: UnknownRecord; reports: UnknownRecord; commands: OperatorCommand[]; onSelect: (command: OperatorCommand) => void }) {
+function OperatorDashboard({ overview, workbooks, queue, storyComms, reports, progress, commands, onSelect }: { overview: OperatorOverview; workbooks: UnknownRecord; queue: UnknownRecord; storyComms: UnknownRecord; reports: UnknownRecord; progress: UnknownRecord; commands: OperatorCommand[]; onSelect: (command: OperatorCommand) => void }) {
   const accountTracker = firstRecord(workbooks, ["account_tracker", "accounts", "outreach"]);
   const storyInventory = firstRecord(storyComms, ["stories", "inventories", "story_inventory"]);
   const communication = firstRecord(storyComms, ["communications", "comms", "outcomes", "outcome_totals"]);
@@ -606,6 +616,7 @@ function OperatorDashboard({ overview, workbooks, queue, storyComms, reports, co
   ] as const;
   return (
     <>
+      <CurrentRunProgressCard progress={progress} compact />
       <section className="operator-metrics" aria-label="Operator workspace metrics">{metrics.map(([label, value, detail]) => <article key={label}><span>{label}</span><strong>{value}</strong><small>{detail}</small></article>)}</section>
       <section className="operator-grid operator-system-grid">
         {systemCards.map(([label, data, available, detail]) => <article key={label}><span className={available ? "system-online" : "system-offline"}>{available ? "Available" : text(data.status, "Unavailable")}</span><h3>{label}</h3><p>{detail}</p><small>{available ? "Minimized local projection" : text(data.reason, "Capability reason available in Operations")}</small></article>)}
@@ -616,24 +627,43 @@ function OperatorDashboard({ overview, workbooks, queue, storyComms, reports, co
   );
 }
 
-function AccountsSurface({ workbooks, commands, onSelect }: { workbooks: UnknownRecord; commands: OperatorCommand[]; onSelect: (command: OperatorCommand) => void }) {
-  const tracker = firstRecord(workbooks, ["account_tracker", "accounts", "outreach"]);
-  const actions = firstList(tracker, ["action_queue", "action_items", "top_actions", "items"]);
+function AccountsSurface({ workbooks, accountTracker, commands, onSelect }: { workbooks: UnknownRecord; accountTracker: UnknownRecord; commands: OperatorCommand[]; onSelect: (command: OperatorCommand) => void }) {
+  const legacyTracker = firstRecord(workbooks, ["account_tracker", "accounts", "outreach"]);
+  const trackerSummary = asRecord(accountTracker.summary);
+  const tracker = Object.keys(trackerSummary).length ? { ...legacyTracker, ...trackerSummary } : legacyTracker;
+  const actions = firstList(legacyTracker, ["action_queue", "action_items", "top_actions", "items"]);
   const actionTotal = number(tracker.action_items_total ?? tracker.action_count, actions.length);
   const actionReturned = number(tracker.action_items_returned, actions.length);
   const actionsTruncated = Boolean(tracker.action_items_truncated);
   const stages = asRecord(tracker.stage_counts ?? tracker.by_stage);
   const tiers = asRecord(tracker.tier_counts ?? tracker.by_tier);
   const activity = asRecord(tracker.activity_totals);
-  const sheetRows = asRecord(tracker.sheet_row_counts);
+  const sheetRows = asRecord(legacyTracker.sheet_row_counts);
+  const openAction = asRecord(accountTracker.open_action);
+  const openCommandId = text(openAction.command_id, "open.account_tracker");
+  const openCommand = commands.find((command) => command.id === openCommandId);
+  const surfaceOpenAvailable = text(openAction.status, "unavailable") === "available";
+  const guardedOpenCommand = openCommand ? {
+    ...openCommand,
+    ...(surfaceOpenAvailable ? {} : {
+      available: false,
+      state: "unavailable",
+      status: "unavailable",
+      reason: text(openAction.reason, "The account tracker projection is not safe to open right now."),
+      unavailable_reason: text(openAction.reason, "The account tracker projection is not safe to open right now."),
+    }),
+    confirmation_phrase: text(openAction.confirmation_phrase, openCommand.confirmation_phrase || "OPEN_ACCOUNT_TRACKER"),
+  } : null;
   return (
     <>
-      <section className="operator-metrics"><article><span>Companies</span><strong>{number(tracker.total ?? tracker.account_count ?? tracker.rows)}</strong><small>Tracker universe</small></article><article><span>Action queue</span><strong>{number(tracker.action_count ?? sheetRows["Action Queue"] ?? actions.length)}</strong><small>Due or active</small></article><article><span>People mapped</span><strong>{number(tracker.people_mapped ?? tracker.contacts ?? activity["People Mapped"])}</strong><small>Relationship surface</small></article><article><span>Workbook sheets</span><strong>{number(tracker.sheet_count ?? tracker.sheets ?? Object.keys(sheetRows).length)}</strong><small>Derived views</small></article></section>
+      <section className="operator-metrics"><article><span>Companies</span><strong>{number(tracker.total ?? tracker.account_count ?? tracker.rows)}</strong><small>Tracker universe</small></article><article><span>Action queue</span><strong>{number(tracker.action_count ?? sheetRows["Action Queue"] ?? actions.length)}</strong><small>{number(tracker.actions_due_now)} due now</small></article><article><span>People mapped</span><strong>{number(tracker.people_mapped ?? tracker.contacts ?? activity["People Mapped"])}</strong><small>Relationship surface</small></article><article><span>Workbook sheets</span><strong>{number(legacyTracker.sheet_count ?? legacyTracker.sheets ?? Object.keys(sheetRows).length)}</strong><small>Derived views</small></article></section>
+      {guardedOpenCommand ? <section className="operator-panel operator-account-open"><div><span>Primary account surface</span><h3>Open the full live tracker in Excel.</h3><p>The cockpit keeps a safe aggregate and today’s bounded action queue; Excel remains the complete editable account system.</p></div><CommandButtons commands={[guardedOpenCommand]} onSelect={onSelect} /></section> : null}
       <section className="operator-split">
         <div className="operator-panel"><div className="operator-panel-head"><div><span>Today’s queue</span><h3>Account moves worth attention</h3></div><small>{actionReturned} of {actionTotal}{actionsTruncated ? " · bounded view" : ""}</small></div><OperatorRows items={actions} empty="No account actions were projected." /></div>
         <aside className="operator-panel operator-breakdown"><span>Portfolio state</span><h3>Stage and tier mix</h3><Breakdown title="Stages" data={stages} /><Breakdown title="Tiers" data={tiers} /></aside>
       </section>
-      <CommandSection title="Account controls" commands={commands.filter((command) => command.id.includes("account") || command.id.includes("campaign"))} onSelect={onSelect} />
+      <CommandSection title="Account controls" commands={commands.filter((command) => (command.id.includes("account") || command.id.includes("campaign")) && command.id !== openCommandId)} onSelect={onSelect} />
+      {accountTracker.status && accountTracker.status !== "available" ? <p className="operator-boundary-note">Account tracker projection: {text(accountTracker.status)}. {text(accountTracker.reason, "The next refresh will recover when its local lock is free.")}</p> : null}
     </>
   );
 }
@@ -755,21 +785,22 @@ function ReportSurface({ reports, sources, commands, onSelect, onOpenReport, rep
   const truncated = Boolean(reports.truncated);
   return (
     <>
-      <section className="operator-metrics"><article><span>Verified reports</span><strong>{number(reports.total ?? reports.count ?? reportItems.length)}</strong><small>Exact run scope</small></article><article><span>Latest run</span><strong className="metric-compact">{text(reports.latest_run_id ?? sources.run_id ?? latestSources.run_id, "Unavailable")}</strong><small>Immutable pointer</small></article><article><span>Sources</span><strong>{number(sources.total ?? sourceItems.length)}</strong><small>Explicit coverage</small></article><article><span>Failures</span><strong>{number(reports.failure_count ?? sources.failure_count)}</strong><small>Never hidden</small></article></section>
-      <section className="operator-panel"><div className="operator-panel-head"><div><span>{showSources ? "Source breakdown" : "Run-scoped briefs"}</span><h3>{showSources ? "What ran, skipped, failed, and advanced" : "Daily reports bound to exact evidence"}</h3></div><small>{showSources ? `${sourceItems.length} exact source rows` : `${returned} of ${total}${truncated ? " · bounded view" : ""}`}</small></div>{showSources ? <SourceRows items={sourceItems} /> : <ReportRows items={reportItems} onOpen={onOpenReport} loadingRunId={reportLoadingRunId} />}</section>
+      <section className="operator-metrics"><article><span>Verified reports</span><strong>{number(reports.total ?? reports.count ?? reportItems.length)}</strong><small>Exact run scope</small></article><article><span>Latest run</span><strong className="metric-compact">{text(reports.latest_run_id ?? sources.run_id ?? latestSources.run_id, "Unavailable")}</strong><small>Immutable pointer</small></article><article><span>Sources</span><strong>{number(sources.total ?? sourceItems.length)}</strong><small>Manifest source families</small></article><article><span>Failures</span><strong>{number(reports.failure_count ?? sources.failure_count)}</strong><small>Never hidden</small></article></section>
+      <section className="operator-panel"><div className="operator-panel-head"><div><span>{showSources ? "Source breakdown" : "Run-scoped briefs"}</span><h3>{showSources ? "What ran, skipped, failed, and advanced" : "Daily reports bound to exact evidence"}</h3></div><small>{showSources ? `${sourceItems.length} exact manifest source-family rows` : `${returned} of ${total}${truncated ? " · bounded view" : ""}`}</small></div>{showSources ? <SourceRows items={sourceItems} /> : <ReportRows items={reportItems} onOpen={onOpenReport} loadingRunId={reportLoadingRunId} />}</section>
       <CommandSection title="Report controls" commands={commands.filter((command) => command.id.includes("report") || command.id.includes("source"))} onSelect={onSelect} />
       <p className="operator-boundary-note">Convenience “latest” mirrors never become run evidence. Refresh is enabled only when a completed summary supplies the exact metrics, queue, and report pointers.</p>
     </>
   );
 }
 
-function VerifiedRunsSurface({ reports, sources, commands, onSelect, onOpenReport, reportLoadingRunId }: { reports: UnknownRecord; sources: UnknownRecord; commands: OperatorCommand[]; onSelect: (command: OperatorCommand) => void; onOpenReport: (runId: string) => Promise<void>; reportLoadingRunId: string }) {
+function VerifiedRunsSurface({ reports, sources, progress, commands, onSelect, onOpenReport, reportLoadingRunId }: { reports: UnknownRecord; sources: UnknownRecord; progress: UnknownRecord; commands: OperatorCommand[]; onSelect: (command: OperatorCommand) => void; onOpenReport: (runId: string) => Promise<void>; reportLoadingRunId: string }) {
   const reportItems = firstList(reports, ["items"]);
   const returned = number(reports.items_returned, reportItems.length);
   const total = number(reports.total, reportItems.length);
   return (
     <>
-      <section className="operator-metrics"><article><span>Verified runs</span><strong>{total}</strong><small>Complete evidence chain</small></article><article><span>Latest run</span><strong className="metric-compact">{text(reports.latest_run_id, "Unavailable")}</strong><small>Run-scoped pointer</small></article><article><span>Latest sources</span><strong>{number(sources.total)}</strong><small>Explicit source rows</small></article><article><span>Latest failures</span><strong>{number(reports.failure_count ?? sources.failure_count)}</strong><small>Never hidden</small></article></section>
+      <CurrentRunProgressCard progress={progress} />
+      <section className="operator-metrics"><article><span>Verified runs</span><strong>{total}</strong><small>Complete evidence chain</small></article><article><span>Latest run</span><strong className="metric-compact">{text(reports.latest_run_id, "Unavailable")}</strong><small>Run-scoped pointer</small></article><article><span>Latest sources</span><strong>{number(sources.total)}</strong><small>Manifest source families</small></article><article><span>Latest failures</span><strong>{number(reports.failure_count ?? sources.failure_count)}</strong><small>Never hidden</small></article></section>
       <section className="operator-panel"><div className="operator-panel-head"><div><span>Verified run ledger</span><h3>Nightly runs with exact bound artifacts</h3></div><small>{returned} of {total}{Boolean(reports.truncated) ? " · bounded view" : ""}</small></div><ReportRows items={reportItems} onOpen={onOpenReport} loadingRunId={reportLoadingRunId} /></section>
       <CommandSection title="Verified run controls" commands={commands.filter((command) => command.id === "production.preflight" || command.id.includes("report"))} onSelect={onSelect} />
       <p className="operator-boundary-note">A row appears only after the nightly summary, manifest, source metrics, queue, and Outreach report pass the complete evidence chain. Mutable workspace snapshots are never substituted for a run artifact.</p>
@@ -777,8 +808,75 @@ function VerifiedRunsSurface({ reports, sources, commands, onSelect, onOpenRepor
   );
 }
 
+function CurrentRunProgressCard({ progress, compact = false }: { progress: UnknownRecord; compact?: boolean }) {
+  const phase = asRecord(progress.phase);
+  const timestamps = asRecord(progress.timestamps);
+  const counts = asRecord(progress.counts);
+  const evidence = asList(progress.evidence);
+  const status = text(progress.status, "unavailable").toLowerCase();
+  const active = Boolean(progress.is_current) && ["running", "attention", "partial"].includes(status);
+  const linkedinLeaseEvidenced = active && (
+    evidence.some((item) => text(item.kind).toLowerCase().includes("linkedin"))
+    || counts.scoring_attempted !== null && counts.scoring_attempted !== undefined
+    || text(phase.id).toLowerCase().includes("linkedin")
+    || text(phase.id).toLowerCase() === "track_2"
+  );
+  const value = (raw: unknown): string => raw === null || raw === undefined || raw === "" ? "—" : String(number(raw));
+  const scoringAvailable = counts.scoring_attempted !== null && counts.scoring_attempted !== undefined;
+  const countCards = scoringAvailable ? [
+    ["Scoring attempts", value(counts.scoring_attempted), "Exact current artifact"],
+    ["Scoring errors", value(counts.scoring_errors), "Must never hide behind exit zero"],
+    ["Accepted", value(counts.accepted_for_write), "Advanced for write"],
+    ["Discovered", value(counts.items_discovered ?? counts.raw_total), "Current evidenced total"],
+  ] : [
+    ["Searches", counts.searches_completed === null || counts.searches_completed === undefined ? "—" : `${value(counts.searches_completed)}/${value(counts.searches_total)}`, "Live source progress"],
+    ["Discovered", value(counts.items_discovered ?? counts.raw_total), "Current evidenced total"],
+    ["Kept", value(counts.kept_total), "Advanced after filtering"],
+    ["Review", value(counts.pending_review_count ?? counts.decision_total), "Human decision surface"],
+  ];
+  return (
+    <section className={`operator-run-progress ${active ? "run-progress-active" : ""} ${compact ? "run-progress-compact" : ""}`}>
+      <span className="operator-live-announcement" role="status" aria-live="polite" aria-atomic="true">{active ? `Run ${text(progress.run_id, "active")}: ${text(phase.label, "in progress")}, ${status}.` : `Run evidence: ${text(phase.label, status)}.`}</span>
+      <div className="operator-run-progress-head">
+        <div><span>{active ? "Active nightly run" : text(progress.selection, "Run evidence").replaceAll("_", " ")}</span><h3>{text(phase.label, active ? "Run in progress" : "No active run")}</h3><p>{text(progress.reason, active ? "The companion is following minimized run-owned evidence on this Mac." : "The next verified run will appear here automatically.")}</p></div>
+        <div className="operator-run-identity"><strong>{text(progress.run_id, "No run ID")}</strong><span className={`operator-live-state state-${status}`}>{active ? `● live · ${status}` : status}</span></div>
+      </div>
+      {active ? <div className="operator-progress-track" role="progressbar" aria-label="Current run phase" aria-valuetext={`${text(phase.label, "Run in progress")} · ${text(phase.status, status)}`}><i /></div> : null}
+      <div className="operator-run-progress-meta"><span>Started <strong>{text(timestamps.started_at)}</strong></span><span>Last progress <strong>{text(timestamps.last_progress_at ?? timestamps.captured_at)}</strong></span><span>Evidence <strong>{evidence.length} bound artifacts</strong></span><span>Phase state <strong>{text(phase.status, status)}</strong></span></div>
+      {!compact || active ? <div className="operator-run-counts">{countCards.map(([label, count, detail]) => <article key={label}><span>{label}</span><strong>{count}</strong><small>{detail}</small></article>)}</div> : null}
+      {linkedinLeaseEvidenced ? <p className="operator-browser-lease">LinkedIn browser contract · ownership-scoped cleanup expected at finalization. This projection proves the run and LinkedIn-related phase or artifact, not a browser PID or cleanup result; verify terminal cleanup evidence before intervening.</p> : null}
+    </section>
+  );
+}
+
+function NextRunPlanSurface({ plan, progress, commands, onSelect }: { plan: UnknownRecord; progress: UnknownRecord; commands: OperatorCommand[]; onSelect: (command: OperatorCommand) => void }) {
+  const items = asList(plan.items);
+  const total = number(plan.items_total, items.length);
+  const returned = number(plan.items_returned, items.length);
+  const highPriority = items.filter((item) => ["blocker", "critical", "high", "1"].includes(text(item.priority, "").toLowerCase())).length;
+  const categories = new Set(items.map((item) => text(item.category, "other")));
+  const currentRun = Boolean(plan.current_run_in_progress) || (progress.status === "running" && Boolean(progress.is_current));
+  const runControls = commands.filter((command) => command.id === "nightly.run" || command.id === "production.preflight" || command.id === "reports.daily.refresh");
+  return (
+    <>
+      {currentRun ? <CurrentRunProgressCard progress={progress} compact /> : null}
+      <section className="operator-metrics"><article><span>Plan items</span><strong>{total}</strong><small>{returned} shown</small></article><article><span>High priority</span><strong>{highPriority}</strong><small>First-pass work</small></article><article><span>Workstreams</span><strong>{categories.size}</strong><small>Evidence-derived</small></article><article><span>Basis run</span><strong className="metric-compact">{text(plan.basis_run_id, "Unavailable")}</strong><small>{text(plan.basis_run_status, "No exact basis")}</small></article></section>
+      <section className="operator-panel operator-next-plan">
+        <div className="operator-panel-head"><div><span>Prioritized action plan</span><h3>{currentRun ? "Working plan while tonight’s run is active" : "Next cycle, in evidence order"}</h3></div><small>{returned} of {total}{Boolean(plan.truncated) ? " · bounded view" : ""}</small></div>
+        {items.length ? <div className="operator-plan-list">{items.map((item, index) => {
+          const evidence = asRecord(item.evidence);
+          const evidenceBits = [evidence.source, evidence.status, evidence.lane, evidence.review_state, evidence.run_id].filter((entry) => entry !== null && entry !== undefined && entry !== "").map(String);
+          return <article key={text(item.id, `${index}`)}><span className="operator-plan-rank">{String(index + 1).padStart(2, "0")}</span><div><small>{text(item.category, "run")} · {text(item.priority, "normal")} priority</small><h3>{text(item.title, "Untitled action")}</h3><p>{text(item.reason, "Exact run evidence supports this next action.")}</p><em>{evidenceBits.length ? evidenceBits.join(" · ") : "Evidence binding retained locally"}</em></div>{item.count !== null && item.count !== undefined ? <strong>{number(item.count)}</strong> : null}</article>;
+        })}</div> : <p className="operator-empty-row">{text(plan.reason, "No grounded next-run actions are available yet.")}</p>}
+      </section>
+      {currentRun ? <p className="operator-boundary-note">This plan is intentionally provisional while the current run is active. It will rebase on the new exact summary, source metrics, action queue, and report after final verification.</p> : null}
+      <CommandSection title="Next-run controls" commands={runControls} onSelect={onSelect} />
+    </>
+  );
+}
+
 function SourceRows({ items }: { items: UnknownRecord[] }) {
-  if (!items.length) return <p className="operator-empty-row">No exact source metrics are eligible yet.</p>;
+  if (!items.length) return <p className="operator-empty-row">No exact manifest source-family metrics are eligible yet.</p>;
   return <div className="operator-row-list">{items.map((item, index) => {
     const raw = number(item.raw_count);
     const kept = number(item.kept_count);

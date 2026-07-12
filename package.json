@@ -1,6 +1,6 @@
 {
   "name": "recruiting-engine-product",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -15,7 +15,7 @@
     "test:companion": "PYTHONPATH=companion python3 -m unittest discover -s companion/tests -v",
     "test:extension": "node --test extension/tests/*.test.mjs && node --check extension/service-worker.js && node --check extension/sidepanel.js && node --check extension/lib/contract.js",
     "verify:privacy": "node scripts/verify-public-boundary.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern static-export"
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern static-export --ignore-pattern static-export.staged --ignore-pattern '.static-export.*'"
   },
   "dependencies": {
     "next": "16.2.10",

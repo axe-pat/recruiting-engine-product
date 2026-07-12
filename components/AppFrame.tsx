@@ -18,6 +18,8 @@ import {
 } from "@/lib/app-contract";
 import type {
   OperatorActionResult,
+  OperatorCurrentRunProgress,
+  OperatorJob,
   OperatorOverview,
   OperatorReportDocument,
   OperatorReview,
@@ -30,6 +32,7 @@ export type AppView =
   | "sources"
   | "queue"
   | "runs"
+  | "plan"
   | "applications"
   | "outreach"
   | "reports"
@@ -38,7 +41,7 @@ export type AppView =
   | "operations"
   | "settings";
 
-type ConnectionState = "checking" | "connected" | "preview" | "error";
+type ConnectionState = "checking" | "connected" | "activation" | "preview" | "error";
 
 type ExistingEngineStatus = {
   configured?: boolean;
@@ -88,14 +91,26 @@ type ExistingEngineSnapshot = {
   };
 };
 
+type OperatorProgressPayload = {
+  schema_version?: string;
+  generated_at?: string;
+  current_run_progress?: OperatorCurrentRunProgress;
+  recent_jobs?: OperatorJob[];
+};
+
 const sessionConfigKey = "recruiting-engine.companion-session.v1";
 const originStorageKey = "recruiting-engine.companion-origin.v1";
+const localUiHeader = "X-Recruiting-Engine-Local-UI";
+const localUiServerHeader = "X-Recruiting-Engine-Local-UI-Server";
+const localCockpitLauncher = "scripts/open-operator-cockpit.sh";
+const compatibleCompanionVersion = "0.3.0";
 
 const navItems: { id: AppView; label: string; glyph: string; href: string }[] = [
   { id: "dashboard", label: "Command center", glyph: "⌁", href: "/app" },
   { id: "sources", label: "Sources", glyph: "◎", href: "/app/sources" },
   { id: "queue", label: "Decision queue", glyph: "◇", href: "/app/queue" },
   { id: "runs", label: "Runs", glyph: "↻", href: "/app/runs" },
+  { id: "plan", label: "Next run", glyph: "→", href: "/app/plan" },
   { id: "applications", label: "Applications", glyph: "▤", href: "/app/applications" },
   { id: "outreach", label: "Outreach", glyph: "↗", href: "/app/outreach" },
   { id: "reports", label: "Reports", glyph: "▥", href: "/app/reports" },
@@ -105,11 +120,123 @@ const navItems: { id: AppView; label: string; glyph: string; href: string }[] = 
   { id: "settings", label: "Settings", glyph: "⚙", href: "/app/settings" },
 ];
 
-function statusLabel(state: ConnectionState): string {
-  if (state === "connected") return "Local companion online";
+function statusLabel(state: ConnectionState, localPrimary = false): string {
+  if (state === "connected") return localPrimary ? "This Mac · always connected" : "Local companion online";
   if (state === "checking") return "Checking companion";
-  if (state === "error") return "Session expired or unavailable";
+  if (state === "activation") return "One secure activation needed";
+  if (state === "error") return localPrimary ? "Local service unavailable" : "Session expired or unavailable";
   return "Not connected · no live data";
+}
+
+function isLoopbackOrigin(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isLocalPrimarySurface(config: CompanionConfig): boolean {
+  if (typeof window === "undefined" || !isLoopbackOrigin(window.location.origin)) return false;
+  try {
+    return new URL(config.baseUrl).origin === window.location.origin;
+  } catch {
+    return false;
+  }
+}
+
+function sameCompanionConfig(left: CompanionConfig, right: CompanionConfig): boolean {
+  return (
+    left.baseUrl.trim().replace(/\/$/, "") === right.baseUrl.trim().replace(/\/$/, "")
+    && left.token === right.token
+  );
+}
+
+class CompanionApiError extends Error {
+  status: number;
+  code: string;
+
+  constructor(message: string, status: number, code = "") {
+    super(message);
+    this.name = "CompanionApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function safeCompanionMessage(value: unknown, fallback: string): string {
+  if (typeof value !== "string") return fallback;
+  const sanitized = value
+    .replace(/re_(?:activate|pair|web|local|ui)_[A-Za-z0-9_-]+/g, "[credential redacted]")
+    .replace(/[\r\n\t]+/g, " ")
+    .trim()
+    .slice(0, 220);
+  return sanitized || fallback;
+}
+
+async function localPrimaryBootstrap(): Promise<{
+  detected: boolean;
+  state: "authenticated" | "activation" | "error";
+  message?: string;
+}> {
+  try {
+    const response = await fetch("/api/v1/local-ui/bootstrap", {
+      method: "GET",
+      cache: "no-store",
+      credentials: "same-origin",
+      redirect: "error",
+      referrerPolicy: "same-origin",
+      headers: { [localUiHeader]: "1" },
+    });
+    if (response.headers.get(localUiServerHeader) !== "1") {
+      return { detected: false, state: "error" };
+    }
+    if (response.ok) {
+      try {
+        const payload = (await response.json()) as {
+          version?: unknown;
+          compatible_companion_version?: unknown;
+        };
+        if (
+          payload.version !== compatibleCompanionVersion
+          || payload.compatible_companion_version !== compatibleCompanionVersion
+        ) {
+          return {
+            detected: true,
+            state: "error",
+            message: "The local UI export and companion service are from different releases. Rebuild the static export, then reinstall the companion after active work finishes.",
+          };
+        }
+        return { detected: true, state: "authenticated" };
+      } catch {
+        return {
+          detected: true,
+          state: "error",
+          message: "The local cockpit returned an invalid compatibility response.",
+        };
+      }
+    }
+    let code = "";
+    let message = "";
+    try {
+      const payload = (await response.json()) as { error?: { code?: unknown; message?: unknown } };
+      code = typeof payload.error?.code === "string" ? payload.error.code : "";
+      message = safeCompanionMessage(payload.error?.message, "");
+    } catch {
+      // A marked local server with a malformed error remains a local server.
+    }
+    if (response.status === 401 && code === "local_ui_activation_required") {
+      return { detected: true, state: "activation", message };
+    }
+    return {
+      detected: true,
+      state: "error",
+      message: message || `The local cockpit bootstrap returned ${response.status}.`,
+    };
+  } catch {
+    return { detected: false, state: "error" };
+  }
 }
 
 function safeSnapshot(value: unknown): DashboardSnapshot | null {
@@ -325,23 +452,52 @@ async function apiRequest<T>(
   path: string,
   init: RequestInit = {},
 ): Promise<T> {
+  const localPrimary = isLocalPrimarySurface(config);
   const response = await fetch(companionUrl(config.baseUrl, path), {
     ...init,
     cache: "no-store",
-    credentials: "omit",
+    credentials: localPrimary ? "same-origin" : "omit",
     redirect: "error",
-    referrerPolicy: "no-referrer",
+    referrerPolicy: localPrimary ? "same-origin" : "no-referrer",
     headers: {
-      ...companionHeaders(config.token),
+      ...(localPrimary ? { [localUiHeader]: "1" } : companionHeaders(config.token)),
       ...(init.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
       ...init.headers,
     },
   });
   if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    throw new Error(detail || `Companion returned ${response.status}`);
+    let code = "";
+    let detail = "";
+    try {
+      const payload = (await response.json()) as { error?: { code?: unknown; message?: unknown } };
+      code = typeof payload.error?.code === "string" ? payload.error.code : "";
+      detail = safeCompanionMessage(payload.error?.message, "");
+    } catch {
+      // Never echo a raw API body into the operational UI.
+    }
+    throw new CompanionApiError(detail || `Companion returned ${response.status}`, response.status, code);
   }
   return (await response.json()) as T;
+}
+
+async function loadOperatorProgress(config: CompanionConfig): Promise<OperatorProgressPayload> {
+  try {
+    return await apiRequest<OperatorProgressPayload>(config, "/api/v1/operator/progress");
+  } catch (error) {
+    const legacyRouteUnavailable = error instanceof CompanionApiError && (
+      error.status === 404
+      || (error.status === 403 && error.code === "insufficient_scope")
+    );
+    if (!legacyRouteUnavailable) throw error;
+    // Seamless upgrade path for a still-running pre-v1.3 companion. The
+    // installed v1.3 service uses the lightweight endpoint above.
+    const legacy = await apiRequest<{ operator?: OperatorOverview }>(config, "/api/v1/operator/overview");
+    return {
+      generated_at: legacy.operator?.generated_at,
+      current_run_progress: legacy.operator?.assets?.current_run_progress,
+      recent_jobs: legacy.operator?.recent_jobs,
+    };
+  }
 }
 
 async function exchangePairingToken(config: CompanionConfig): Promise<CompanionConfig> {
@@ -395,62 +551,150 @@ export function AppFrame({ view }: { view: AppView }) {
   const [operatorOverview, setOperatorOverview] = useState<OperatorOverview | null>(null);
   const [preferencesData, setPreferencesData] = useState<Record<string, unknown>>({});
   const [autoReviewCommandId, setAutoReviewCommandId] = useState("");
+  const [localPrimary, setLocalPrimary] = useState(false);
+  const dashboardLoadRef = useRef<{ generation: number; controller: AbortController | null }>({
+    generation: 0,
+    controller: null,
+  });
+  const activeConfigRef = useRef<CompanionConfig>(defaultCompanionConfig);
+  const currentRunProgress = operatorOverview?.assets?.current_run_progress;
+  const pollingBaselineRef = useRef<{
+    status: OperatorCurrentRunProgress["status"];
+    scoringErrors: number | null | undefined;
+  }>({ status: currentRunProgress?.status, scoringErrors: currentRunProgress?.counts?.scoring_errors });
+
+  useEffect(() => {
+    pollingBaselineRef.current = {
+      status: currentRunProgress?.status,
+      scoringErrors: currentRunProgress?.counts?.scoring_errors,
+    };
+  }, [currentRunProgress?.counts?.scoring_errors, currentRunProgress?.status]);
+  const scheduledRunActive = Boolean(
+    currentRunProgress?.is_current
+    && ["running", "attention", "partial"].includes(String(currentRunProgress.status)),
+  );
+  const activeOperatorJobIds = (operatorOverview?.recent_jobs ?? [])
+    .filter((job) => job.status === "queued" || job.status === "running")
+    .map((job) => job.id)
+    .sort()
+    .join("|");
+  const cockpitJobActive = Boolean(activeOperatorJobIds);
+  const runInFlight = scheduledRunActive || cockpitJobActive;
+
+  const invalidateDashboardLoads = useCallback(() => {
+    dashboardLoadRef.current.generation += 1;
+    dashboardLoadRef.current.controller?.abort();
+    dashboardLoadRef.current.controller = null;
+  }, []);
 
   const loadDashboard = useCallback(async (nextConfig: CompanionConfig) => {
+    if (!sameCompanionConfig(nextConfig, activeConfigRef.current)) return false;
+    const generation = dashboardLoadRef.current.generation + 1;
+    dashboardLoadRef.current.controller?.abort();
+    const controller = new AbortController();
+    dashboardLoadRef.current = { generation, controller };
+    const request = <T,>(path: string) => apiRequest<T>(
+      nextConfig,
+      path,
+      { signal: controller.signal },
+    );
+    const isCurrent = () => (
+      !controller.signal.aborted
+      && dashboardLoadRef.current.generation === generation
+      && dashboardLoadRef.current.controller === controller
+      && sameCompanionConfig(nextConfig, activeConfigRef.current)
+    );
     try {
-      await apiRequest(nextConfig, "/api/v1/health");
+      await request("/api/v1/health");
       // Resolve mode before choosing a read model. Existing-engine mode must not
       // fetch the portable dashboard because that DTO can contain recipient and
       // message-body fields that the minimized operator contract intentionally omits.
-      const preferences = await apiRequest<{ preferences?: Record<string, unknown> }>(nextConfig, "/api/v1/preferences");
+      const preferences = await request<{ preferences?: Record<string, unknown> }>("/api/v1/preferences");
       const nextMode = preferences.preferences?.mode === "existing" ? "existing" : "portable";
       let existing: { existing_engine?: ExistingEngineStatus } = {};
-      let existingEvidence: { existing_engine?: ExistingEngineSnapshot } = {};
       let operatorPayload: { operator?: OperatorOverview } = {};
       let nextSnapshot: DashboardSnapshot;
       if (nextMode === "existing") {
-        [existing, existingEvidence, operatorPayload] = await Promise.all([
-          apiRequest<{ existing_engine?: ExistingEngineStatus }>(nextConfig, "/api/v1/existing-engine/status"),
-          apiRequest<{ existing_engine?: ExistingEngineSnapshot }>(nextConfig, "/api/v1/existing-engine/snapshot"),
-          apiRequest<{ operator?: OperatorOverview }>(nextConfig, "/api/v1/operator/overview"),
+        [existing, operatorPayload] = await Promise.all([
+          request<{ existing_engine?: ExistingEngineStatus }>("/api/v1/existing-engine/status"),
+          request<{ operator?: OperatorOverview }>("/api/v1/operator/overview"),
         ]);
         nextSnapshot = operatorShellSnapshot(operatorPayload.operator?.generated_at);
       } else {
-        const payload = await apiRequest<unknown>(nextConfig, "/api/v1/dashboard");
+        const payload = await request<unknown>("/api/v1/dashboard");
         const portableSnapshot = safeSnapshot(payload);
         if (!portableSnapshot) throw new Error("The companion returned an incompatible dashboard payload.");
         nextSnapshot = portableSnapshot;
       }
+      if (!isCurrent()) return false;
       setSnapshot(nextSnapshot);
       setWorkspaceMode(nextMode);
       setPreferencesData(preferences.preferences ?? {});
       setExistingEngine(existing.existing_engine ?? null);
-      setExistingSnapshot(existingEvidence.existing_engine ?? null);
+      setExistingSnapshot(null);
       setOperatorOverview(operatorPayload.operator ?? null);
       setConnection("connected");
       setNotice("");
       return true;
     } catch (error) {
+      if (!isCurrent()) return false;
       setSnapshot(previewSnapshot);
       setOperatorOverview(null);
-      setConnection(nextConfig.token ? "error" : "preview");
-      setNotice(error instanceof Error ? error.message : "Could not reach the companion.");
+      const activationRequired = isLocalPrimarySurface(nextConfig)
+        && error instanceof CompanionApiError
+        && error.status === 401;
+      setConnection(activationRequired ? "activation" : (nextConfig.token || isLocalPrimarySurface(nextConfig)) ? "error" : "preview");
+      setNotice(
+        activationRequired
+          ? `This browser needs one secure local activation. Run ${localCockpitLauncher} from the product folder; no pairing token is involved.`
+          : error instanceof Error ? error.message : "Could not reach the companion.",
+      );
       return false;
+    } finally {
+      if (dashboardLoadRef.current.generation === generation && dashboardLoadRef.current.controller === controller) {
+        dashboardLoadRef.current.controller = null;
+      }
     }
   }, []);
 
+  useEffect(() => () => invalidateDashboardLoads(), [invalidateDashboardLoads]);
+
   useEffect(() => {
-    let nextConfig = defaultCompanionConfig;
-    try {
-      const storedOrigin = window.localStorage.getItem(originStorageKey);
-      if (storedOrigin) nextConfig = { ...nextConfig, baseUrl: storedOrigin };
-      const storedSession = window.sessionStorage.getItem(sessionConfigKey);
-      if (storedSession) nextConfig = { ...nextConfig, ...(JSON.parse(storedSession) as CompanionConfig) };
-    } catch {
-      // Corrupt device-local config falls back to the safe loopback default.
-    }
+    let cancelled = false;
     const hydrate = async () => {
-      await Promise.resolve();
+      if (isLoopbackOrigin(window.location.origin)) {
+        const bootstrap = await localPrimaryBootstrap();
+        if (cancelled) return;
+        if (bootstrap.detected) {
+          const primaryConfig = { baseUrl: window.location.origin, token: "" };
+          setLocalPrimary(true);
+          activeConfigRef.current = primaryConfig;
+          setConfig(primaryConfig);
+          if (bootstrap.state === "authenticated") {
+            await loadDashboard(primaryConfig);
+          } else if (bootstrap.state === "activation") {
+            setConnection("activation");
+            setNotice(`Activate this browser once with ${localCockpitLauncher}. The resulting protected cookie survives normal reloads and companion restarts.`);
+          } else {
+            setConnection("error");
+            setNotice(bootstrap.message || "The local cockpit service could not establish its protected browser session.");
+          }
+          return;
+        }
+      }
+
+      let nextConfig = defaultCompanionConfig;
+      try {
+        const storedOrigin = window.localStorage.getItem(originStorageKey);
+        if (storedOrigin) nextConfig = { ...nextConfig, baseUrl: storedOrigin };
+        const storedSession = window.sessionStorage.getItem(sessionConfigKey);
+        if (storedSession) nextConfig = { ...nextConfig, ...(JSON.parse(storedSession) as CompanionConfig) };
+      } catch {
+        // Corrupt device-local config falls back to the safe loopback default.
+      }
+      if (cancelled) return;
+      setLocalPrimary(false);
+      activeConfigRef.current = nextConfig;
       setConfig(nextConfig);
       if (!nextConfig.token) {
         setConnection("preview");
@@ -459,15 +703,21 @@ export function AppFrame({ view }: { view: AppView }) {
       await loadDashboard(nextConfig);
     };
     void hydrate();
+    return () => { cancelled = true; };
   }, [loadDashboard]);
 
   useEffect(() => {
-    if (view !== "runs") return;
+    if (view !== "runs" || connection !== "connected" || workspaceMode !== "existing") return;
     const requested = new URLSearchParams(window.location.search).get("start");
     if (requested !== "nightly") return;
+    if (runInFlight) {
+      window.history.replaceState(null, "", window.location.pathname);
+      const timer = window.setTimeout(() => setNotice("A local operator run or job is already active. Follow its live evidence instead of starting another nightly."), 0);
+      return () => window.clearTimeout(timer);
+    }
     const timer = window.setTimeout(() => setAutoReviewCommandId("nightly.run"), 0);
     return () => window.clearTimeout(timer);
-  }, [view]);
+  }, [connection, runInFlight, view, workspaceMode]);
 
   useEffect(() => {
     if (!mobileNav) return;
@@ -479,46 +729,175 @@ export function AppFrame({ view }: { view: AppView }) {
   }, [mobileNav]);
 
   useEffect(() => {
-    const active = operatorOverview?.recent_jobs?.some((job) => job.status === "queued" || job.status === "running");
-    if (!active || connection !== "connected" || workspaceMode !== "existing") return;
-    const activeJobIds = new Set(
-      (operatorOverview?.recent_jobs ?? [])
-        .filter((job) => job.status === "queued" || job.status === "running")
-        .map((job) => job.id),
-    );
+    if (!runInFlight || connection !== "connected" || workspaceMode !== "existing") return;
+    const activeJobIds = new Set(activeOperatorJobIds.split("|").filter(Boolean));
+    const startingRunId = currentRunProgress?.run_id;
+    const progressCount = (value: unknown): number | null => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+    };
+    const pollingBaseline = pollingBaselineRef.current;
+    let lastObservedStatus = String(pollingBaseline.status ?? "");
+    let lastObservedScoringErrors = progressCount(
+      pollingBaseline.scoringErrors,
+    ) ?? 0;
+    let scoringIncreaseRefreshed = false;
+    let consecutiveFailures = 0;
+    let lastSuccessfulPollAt = Date.now();
     let cancelled = false;
+    let pollingDone = false;
+    let timer: number | undefined;
+    const scheduleNext = (delay = 4000) => {
+      if (!cancelled && !pollingDone) timer = window.setTimeout(() => { void poll(); }, delay);
+    };
+    const lastSuccessLabel = () => new Date(lastSuccessfulPollAt).toLocaleTimeString(
+      undefined,
+      { hour: "2-digit", minute: "2-digit", second: "2-digit" },
+    );
+    const markPollingUnavailable = (state: "activation" | "error", message: string) => {
+      pollingDone = true;
+      invalidateDashboardLoads();
+      setOperatorOverview((current) => {
+        if (!current) return current;
+        const prior = current.assets?.current_run_progress;
+        return {
+          ...current,
+          assets: {
+            ...current.assets,
+            current_run_progress: prior ? {
+              ...prior,
+              status: "partial",
+              is_current: false,
+              reason: message,
+              phase: { ...prior.phase, status: "stale" },
+            } : prior,
+          },
+          recent_jobs: [],
+        };
+      });
+      setConnection(state);
+      setNotice(message);
+    };
     const poll = async () => {
+      let nextDelay = 4000;
       try {
-        const payload = await apiRequest<{ items?: OperatorOverview["recent_jobs"] }>(config, "/api/v1/operator/jobs?limit=10");
+        const payload = await loadOperatorProgress(config);
         if (cancelled) return;
-        const jobs = payload.items ?? [];
-        setOperatorOverview((current) => current ? { ...current, recent_jobs: jobs } : current);
-        if (!jobs.some((job) => job.status === "queued" || job.status === "running")) {
+        const recoveredAfterFailures = consecutiveFailures > 0;
+        consecutiveFailures = 0;
+        lastSuccessfulPollAt = Date.now();
+        if (recoveredAfterFailures) {
+          setNotice(`Live progress reconnected at ${lastSuccessLabel()}.`);
+        }
+        const jobs = payload.recent_jobs ?? [];
+        const nextProgress = payload.current_run_progress;
+        const mergeProgress = () => setOperatorOverview((current) => current ? {
+          ...current,
+          generated_at: payload.generated_at ?? current.generated_at,
+          assets: { ...current.assets, current_run_progress: nextProgress },
+          recent_jobs: jobs,
+        } : current);
+        const nextStatus = String(nextProgress?.status ?? "");
+        const nextScoringErrors = progressCount(nextProgress?.counts?.scoring_errors);
+        const enteredAttention = (
+          ["attention", "partial"].includes(nextStatus)
+          && !["attention", "partial"].includes(lastObservedStatus)
+        );
+        const scoringErrorsIncreased = (
+          nextScoringErrors !== null
+          && nextScoringErrors > lastObservedScoringErrors
+        );
+        const refreshCurrentPlan = enteredAttention || (
+          scoringErrorsIncreased && !scoringIncreaseRefreshed
+        );
+        if (scoringErrorsIncreased) {
+          lastObservedScoringErrors = nextScoringErrors;
+          scoringIncreaseRefreshed = true;
+        }
+        lastObservedStatus = nextStatus;
+        const nextRunActive = Boolean(nextProgress?.is_current && ["running", "attention", "partial"].includes(String(nextProgress.status)));
+        const nextJobActive = jobs.some((job) => job.status === "queued" || job.status === "running");
+        if (!nextJobActive && !nextRunActive) {
           const finished = jobs.find((job) => activeJobIds.has(job.id) && job.status !== "queued" && job.status !== "running");
+          const exactSameRunTerminal = Boolean(
+            startingRunId
+            && nextProgress?.run_id === startingRunId
+            && !nextProgress?.is_current
+            && ["complete", "attention"].includes(String(nextProgress.status)),
+          );
+          if (startingRunId && !finished && !exactSameRunTerminal) {
+            setNotice(`Run ${startingRunId} is finalizing. Waiting for its exact summary, manifest, source metrics, action queue, and report chain.`);
+            return;
+          }
+          pollingDone = true;
+          mergeProgress();
           await loadDashboard(config);
-          if (finished && !cancelled) {
-            const runSuffix = finished.result_run_id ? ` Run ${finished.result_run_id}.` : "";
-            setNotice(`${finished.label || "Operator action"}: ${finished.summary || finished.status || "finished"}${runSuffix}`);
+          if (!cancelled) {
+            if (finished) {
+              const runSuffix = finished.result_run_id ? ` Run ${finished.result_run_id}.` : "";
+              setNotice(`${finished.label || "Operator action"}: ${finished.summary || finished.status || "finished"}${runSuffix}`);
+            } else if (startingRunId) {
+              setNotice(`Run ${startingRunId} reached ${nextProgress?.status || "a terminal state"}. Its exact report chain is now available for verification.`);
+            }
+          }
+        } else {
+          mergeProgress();
+          if (nextRunActive && refreshCurrentPlan) {
+            await loadDashboard(config);
+            if (cancelled) return;
           }
         }
-      } catch {
-        // The next explicit refresh will recover a transient local polling error.
+      } catch (error) {
+        if (cancelled) return;
+        const apiError = error instanceof CompanionApiError ? error : null;
+        const lastSuccess = lastSuccessLabel();
+        if (apiError?.status === 401) {
+          markPollingUnavailable(
+            localPrimary ? "activation" : "error",
+            localPrimary
+              ? `Local browser authentication expired. Last successful live update: ${lastSuccess}. Run ${localCockpitLauncher} once to reactivate this browser.`
+              : `The hosted companion session expired. Last successful live update: ${lastSuccess}. Pair this tab again before trusting run status.`,
+          );
+          return;
+        }
+        const retryable = !apiError || apiError.status === 429 || apiError.status >= 500;
+        if (!retryable) {
+          markPollingUnavailable(
+            "error",
+            `Live progress access failed with HTTP ${apiError?.status ?? "error"}. Last successful live update: ${lastSuccess}. Refresh the authenticated cockpit before trusting run status.`,
+          );
+          return;
+        }
+        consecutiveFailures += 1;
+        nextDelay = Math.min(30_000, 4000 * (2 ** consecutiveFailures));
+        if (consecutiveFailures >= 3) {
+          markPollingUnavailable(
+            "error",
+            `Live progress is stale after ${consecutiveFailures} consecutive polling failures. Last successful live update: ${lastSuccess}. The cockpit has stopped claiming this run is live.`,
+          );
+          return;
+        }
+        setNotice(
+          `Live progress refresh failed; retrying in ${Math.round(nextDelay / 1000)} seconds. Last successful live update: ${lastSuccess}.`,
+        );
+      } finally {
+        scheduleNext(nextDelay);
       }
     };
-    const timer = window.setInterval(() => { void poll(); }, 2500);
+    void poll();
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [config, connection, loadDashboard, operatorOverview?.recent_jobs, workspaceMode]);
+  }, [activeOperatorJobIds, config, connection, currentRunProgress?.run_id, invalidateDashboardLoads, loadDashboard, localPrimary, runInFlight, workspaceMode]);
 
   const runEngine = async () => {
     if (connection !== "connected") {
-      setNotice("Pair the local companion before starting a real run.");
+      setNotice(localPrimary ? "The primary local service is unavailable. Restore the companion, then reload this page." : "Pair the local companion before starting a real run.");
       return;
     }
     if (workspaceMode === "existing") {
-      window.location.assign("/app/runs?start=nightly");
+      window.location.assign(scheduledRunActive ? "/app/runs" : cockpitJobActive ? "/app/operations" : "/app/runs?start=nightly");
       return;
     }
     setRunning(true);
@@ -551,10 +930,12 @@ export function AppFrame({ view }: { view: AppView }) {
       setNotice("Already connected. The pairing token was consumed once and this tab is using its short-lived private session; do not paste it again.");
       return;
     }
+    invalidateDashboardLoads();
     let normalized = {
       baseUrl: nextConfig.baseUrl.trim().replace(/\/$/, ""),
       token: nextConfig.token.trim(),
     };
+    activeConfigRef.current = { baseUrl: normalized.baseUrl, token: "__pending_pairing__" };
     setConnection("checking");
     try {
       normalized = await exchangePairingToken(normalized);
@@ -565,6 +946,7 @@ export function AppFrame({ view }: { view: AppView }) {
     }
     window.localStorage.setItem(originStorageKey, normalized.baseUrl);
     window.sessionStorage.setItem(sessionConfigKey, JSON.stringify(normalized));
+    activeConfigRef.current = normalized;
     setConfig(normalized);
     const connected = await loadDashboard(normalized);
     if (connected) setNotice("Paired. Private records remain on this device.");
@@ -790,8 +1172,15 @@ export function AppFrame({ view }: { view: AppView }) {
   };
 
   const disconnectCompanion = () => {
+    if (localPrimary) {
+      setNotice("This is the permanent local cockpit. Its device binding is managed by the loopback companion, so there is no token session to disconnect.");
+      return;
+    }
+    invalidateDashboardLoads();
     window.sessionStorage.removeItem(sessionConfigKey);
-    setConfig((current) => ({ ...current, token: "" }));
+    const disconnectedConfig = { ...activeConfigRef.current, token: "" };
+    activeConfigRef.current = disconnectedConfig;
+    setConfig(disconnectedConfig);
     setSnapshot(previewSnapshot);
     setConnection("preview");
     setWorkspaceMode("portable");
@@ -836,7 +1225,7 @@ export function AppFrame({ view }: { view: AppView }) {
           <span className={`connection-dot dot-${connection}`} />
           <div>
             <small>Workspace</small>
-            <strong>{connection === "connected" ? snapshot.profile.displayName : connection === "checking" ? "Checking this Mac" : "No live workspace"}</strong>
+            <strong>{connection === "connected" ? (localPrimary ? "Primary local workspace" : snapshot.profile.displayName) : connection === "checking" ? "Checking this Mac" : "No live workspace"}</strong>
           </div>
         </div>
 
@@ -856,7 +1245,7 @@ export function AppFrame({ view }: { view: AppView }) {
         <div className="app-sidebar-foot">
           <a href="/app/onboarding">+ New workspace</a>
           <a href="/story">Product story ↗</a>
-          <p>Local-first · Human-gated</p>
+          <p>{localPrimary ? "Primary on this Mac · Human-gated" : "Local-first · Human-gated"}</p>
         </div>
       </aside>
 
@@ -878,12 +1267,12 @@ export function AppFrame({ view }: { view: AppView }) {
           </div>
           <div className="topbar-actions">
             <span className={`connection-pill connection-${connection}`}>
-              <i /> {statusLabel(connection)}
+              <i /> {statusLabel(connection, localPrimary)}
             </span>
             {connection === "connected" && workspaceMode === "existing" ? <button className="refresh-button" type="button" onClick={refreshCockpit} disabled={running}>↻ Refresh</button> : null}
-            <button className="run-button" type="button" onClick={runEngine} disabled={running} aria-label={workspaceMode === "existing" ? "Open the reviewed end-to-end nightly run" : "Run the portable engine"}>
-              <span>{running ? "Working" : workspaceMode === "existing" ? "Run E2E" : connection === "connected" ? "Run engine" : "Connect to run"}</span>
-              <b aria-hidden="true">{running ? "…" : "▶"}</b>
+            <button className="run-button" type="button" onClick={runEngine} disabled={running} aria-label={workspaceMode === "existing" ? scheduledRunActive ? "Open the live end-to-end run" : cockpitJobActive ? "Open the active local operator job" : "Open the reviewed end-to-end nightly run" : "Run the portable engine"}>
+              <span>{running ? "Working" : workspaceMode === "existing" ? scheduledRunActive ? "View live run" : cockpitJobActive ? "View active job" : "Run E2E" : connection === "connected" ? "Run engine" : "Connect to run"}</span>
+              <b aria-hidden="true">{running ? "…" : runInFlight ? "●" : "▶"}</b>
             </button>
           </div>
         </header>
@@ -891,7 +1280,7 @@ export function AppFrame({ view }: { view: AppView }) {
         {notice ? (
           <div className="app-notice" role="status">
             <span>{notice}</span>
-            {connection !== "connected" ? <a href="/app/settings">Connect companion →</a> : null}
+            {connection !== "connected" ? <a href="/app/settings">{localPrimary ? "View local service →" : "Connect companion →"}</a> : null}
             <button type="button" onClick={() => setNotice("")} aria-label="Dismiss notice">
               ×
             </button>
@@ -900,13 +1289,14 @@ export function AppFrame({ view }: { view: AppView }) {
 
         <div className="app-content">
           {view !== "settings" && connection !== "connected" ? (
-            <ConnectionGate connection={connection} view={view} />
+            <ConnectionGate connection={connection} view={view} localPrimary={localPrimary} />
           ) : (
           <>
           {view === "dashboard" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <Dashboard snapshot={snapshot} mode={mode} workspaceMode={workspaceMode} existingEngine={existingEngine} existingSnapshot={existingSnapshot} />) : null}
           {view === "sources" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <SourcesView snapshot={snapshot} onImport={importJobs} />) : null}
           {view === "queue" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <QueueView snapshot={snapshot} />) : null}
           {view === "runs" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <RunsView snapshot={snapshot} />) : null}
+          {view === "plan" ? <OperatorWorkspace view={view} overview={workspaceMode === "existing" ? operatorOverview : null} connected={connection === "connected" && workspaceMode === "existing"} onAction={runOperatorAction} {...operatorReviewProps} /> : null}
           {view === "applications" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <ApplicationsView snapshot={snapshot} />) : null}
           {view === "outreach" ? (
             workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <OutreachView snapshot={snapshot} onApprove={approveOutreach} />
@@ -921,6 +1311,7 @@ export function AppFrame({ view }: { view: AppView }) {
               snapshot={snapshot}
               workspaceMode={workspaceMode}
               existingEngine={existingEngine}
+              localPrimary={localPrimary}
               onModeChange={changeWorkspaceMode}
               onDisconnect={disconnectCompanion}
               onSave={saveConfig}
@@ -934,18 +1325,23 @@ export function AppFrame({ view }: { view: AppView }) {
   );
 }
 
-function ConnectionGate({ connection, view }: { connection: ConnectionState; view: AppView }) {
+function ConnectionGate({ connection, view, localPrimary }: { connection: ConnectionState; view: AppView; localPrimary: boolean }) {
   const checking = connection === "checking";
+  const activation = connection === "activation";
   return (
     <section className="operator-empty app-panel connection-gate" aria-live="polite">
-      <span className="operator-kicker">{checking ? "Checking private companion" : "Live data is disconnected"}</span>
-      <h2>{checking ? "Looking for your local recruiting engine…" : `Connect this Mac to open ${navItems.find((item) => item.id === view)?.label.toLowerCase() || "this workspace"}.`}</h2>
+      <span className="operator-kicker">{checking ? "Checking private companion" : activation ? "One-time secure browser activation" : localPrimary ? "Local cockpit service unavailable" : "Live data is disconnected"}</span>
+      <h2>{checking ? "Looking for your local recruiting engine…" : activation ? "Activate this browser once; keep using it without pairing tokens." : localPrimary ? "Restart the local companion to restore this workspace." : `Connect this Mac to open ${navItems.find((item) => item.id === view)?.label.toLowerCase() || "this workspace"}.`}</h2>
       <p>
         {checking
           ? "No records will appear until the authenticated local workspace responds."
-          : "No company, queue, run, or report shown on this screen is mock data. Pair the local companion to load your real workspace; fictional preview records are no longer rendered on operational routes."}
+          : activation
+            ? `From the RecruitingEngine Product folder, run ${localCockpitLauncher}. It opens a two-minute, single-use local link and stores only a protected HttpOnly cookie in this browser; subsequent reloads and normal companion restarts reconnect automatically.`
+          : localPrimary
+            ? "This browser is already device-bound and never needs a pairing token. The companion is not responding to authenticated same-origin requests right now."
+            : "No company, queue, run, or report shown on this screen is mock data. Pair the local companion to load your real workspace; fictional preview records are no longer rendered on operational routes."}
       </p>
-      {!checking ? <div><a href="/app/settings">Connect this Mac →</a><a href="/install">Open pairing guide ↗</a></div> : null}
+      {activation ? <div><code>{localCockpitLauncher}</code><a href="/app/settings">Activation details →</a></div> : !checking ? <div>{localPrimary ? <a href="/app/settings">View local binding →</a> : <a href="/app/settings">Connect this Mac →</a>}<a href="/install">Open setup guide ↗</a></div> : null}
     </section>
   );
 }
@@ -1369,6 +1765,7 @@ function SettingsView({
   snapshot,
   workspaceMode,
   existingEngine,
+  localPrimary,
   onModeChange,
   onDisconnect,
   onSave,
@@ -1378,6 +1775,7 @@ function SettingsView({
   snapshot: DashboardSnapshot;
   workspaceMode: "portable" | "existing";
   existingEngine: ExistingEngineStatus | null;
+  localPrimary: boolean;
   onModeChange: (mode: "portable" | "existing") => Promise<void>;
   onDisconnect: () => void;
   onSave: (config: CompanionConfig) => Promise<void>;
@@ -1407,8 +1805,17 @@ function SettingsView({
   return (
     <div className="settings-layout">
       <section className="app-panel settings-card">
-        <PageLead eyebrow="Device pairing" title="Connect the private companion." body="The loopback address may persist; the hosted app keeps a 12-hour token only in this tab session so a full nightly run can finish without disconnecting. Your documents and records stay in the local companion." />
-        {connection === "connected" ? (
+        <PageLead eyebrow={localPrimary ? "Permanent local binding" : "Device pairing"} title={localPrimary ? "This is the primary cockpit on this Mac." : "Connect the private companion."} body={localPrimary ? "The UI and companion share one loopback origin. Authentication stays in a protected device cookie, so opening this local URL never requires copying or storing a pairing token in the browser." : "The loopback address may persist; the hosted app keeps a 12-hour token only in this tab session so a full nightly run can finish without disconnecting. Your documents and records stay in the local companion."} />
+        {localPrimary ? (
+          <div className="pairing-connected-card" role="status">
+            <span className={`connection-dot dot-${connection}`} />
+            <div>
+              <strong>{connection === "connected" ? "Permanently connected on this Mac" : connection === "activation" ? "Secure activation needed once in this browser" : "Waiting for the local companion"}</strong>
+              <p>{connection === "activation" ? `Run ${localCockpitLauncher} from the product folder. Its short-lived link is consumed once; the protected cookie then persists across reloads and normal service restarts.` : "No token paste, session-storage credential, or periodic re-pairing is used on this surface. Hosted pairing remains available only for the later public-product path."}</p>
+              {connection === "activation" ? <code>{localCockpitLauncher}</code> : <small>{config.baseUrl}/app/</small>}
+            </div>
+          </div>
+        ) : connection === "connected" ? (
           <div className="pairing-connected-card" role="status">
             <span className="connection-dot dot-connected" />
             <div><strong>Connected in this tab</strong><p>The one-time pairing token was consumed successfully. This tab now uses a short-lived private session, so pasting the same token again will correctly be rejected.</p><small>{config.baseUrl}</small></div>
@@ -1421,8 +1828,8 @@ function SettingsView({
           </form>
         )}
         {formError ? <p className="settings-form-error" role="alert">{formError}</p> : null}
-        <p className="settings-status"><span className={`connection-dot dot-${connection}`} />{statusLabel(connection)}</p>
-        {connection === "connected" ? <button className="disconnect-button" type="button" onClick={onDisconnect}>Disconnect and pair again</button> : null}
+        <p className="settings-status"><span className={`connection-dot dot-${connection}`} />{statusLabel(connection, localPrimary)}</p>
+        {connection === "connected" && !localPrimary ? <button className="disconnect-button" type="button" onClick={onDisconnect}>Disconnect and pair again</button> : null}
       </section>
       <section className="app-panel settings-card">
         <PageLead eyebrow="Workspace mode" title="Portable or existing engine." body="New users start with a compact profile. Existing operators can bind the same UI to an installed Recruiting Engine checkout." />

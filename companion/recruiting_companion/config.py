@@ -195,13 +195,26 @@ class Settings:
     @staticmethod
     def is_host_allowed(host_header: str | None, bound_port: int) -> bool:
         """Reject non-loopback Host headers to prevent browser DNS rebinding."""
-        if not host_header:
+        if (
+            not host_header
+            or len(host_header) > 255
+            or any(character.isspace() for character in host_header)
+            or any(character in host_header for character in "/\\@?#,")
+        ):
             return False
         try:
             parsed = urlsplit(f"//{host_header}")
             hostname = (parsed.hostname or "").lower()
             port = parsed.port
         except ValueError:
+            return False
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+        ):
             return False
         if hostname not in {"localhost", "127.0.0.1", "::1"}:
             return False

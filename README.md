@@ -1,5 +1,8 @@
 # Recruiting Engine
 
+**Primary operator UI on this Mac:**
+[127.0.0.1:8765/app](http://127.0.0.1:8765/app/)
+
 **Live product:** [axe-pat.github.io](https://axe-pat.github.io/)
 
 **Working app:** [axe-pat.github.io/app](https://axe-pat.github.io/app/)
@@ -10,12 +13,13 @@ Recruiting Engine is a local-first recruiting decision system built from a real,
 months-long operating workflow. It turns role, company, and relationship evidence
 into one reviewed queue: apply, reach out, follow up, research, watch, or skip.
 
-The product now has three cooperating surfaces:
+The product now has four cooperating surfaces:
 
 | Surface | Responsibility | Data boundary |
 |---|---|---|
-| Hosted command center | Onboarding, dashboards, sources, queues, runs, applications, outreach review, and full exact reports | Connection gate until paired; real local data only on operational routes |
-| Local companion | SQLite system of record, document storage, pairing, imports, deterministic portable runs, existing-engine evidence, and audited fixed actions | User device only |
+| Primary local command center | Daily dashboards, queues, exact run progress, next-run plan, account tracker, reports, and reviewed execution | Same-origin loopback UI; persistently connected on this device |
+| Hosted command center | Product story, onboarding, portable workflow, and the later public path | Connection gate until paired; real local data only on operational routes |
+| Local companion | Static application serving, SQLite system of record, document storage, persistent local UI auth, pairing, imports, deterministic portable runs, existing-engine evidence, and audited fixed actions | User device only |
 | Chrome companion | Explicit page/paste intake and recipient-plus-draft approval | Device-local; no send action |
 
 The original operating depth remains in two source engines:
@@ -28,11 +32,10 @@ The original operating depth remains in two source engines:
 ## Product architecture
 
 ```text
-Hosted command center (public code, no operational data while unpaired)
+Primary local command center + API (same loopback origin, persistent cookie)
                 │
-                │ one-time loopback pairing
                 ▼
-Local companion (SQLite + private document directory)
+Local companion (validated static export + SQLite + private document directory)
        │                         │
        │ portable mode           │ guarded operator adapter
        ▼                         ▼
@@ -41,12 +44,21 @@ deterministic queue        exact summary → manifest → report evidence
        ▲
        │ explicit intake and approval
 Chrome MV3 side panel
+
+Hosted command center (optional/later public path)
+                │ one-time pairing + tab-scoped web session
+                └──────────────────────────────► Local companion
 ```
 
-The website never becomes the database. It persists only a loopback origin; a
-12-hour web token lives in tab-scoped session storage so a full nightly cycle can
-finish without losing its authenticated result view. Private documents and
-operational records go directly to the companion running on that device.
+The website never becomes the database. The primary local UI is served at
+`http://127.0.0.1:8765/app/` by the same companion that serves its API. A
+restart-stable, host-only `HttpOnly`, `SameSite=Strict` local cookie keeps it
+connected after one explicit `scripts/open-operator-cockpit.sh` activation,
+without exposing the bearer token to browser JavaScript or asking for new
+pairing codes. Raw HTML cannot mint that cookie. The hosted UI retains its
+separate one-time pairing and
+12-hour tab-scoped web session for the future public/portable path. Private
+documents and operational records remain on the device.
 
 ## Product routes
 
@@ -54,45 +66,62 @@ operational records go directly to the companion running on that device.
 - `/app/onboarding` — four-step private onboarding with curated uploads;
 - `/app/sources` — Handshake/generic CSV import and explicit connector states;
 - `/app/queue` — one human-gated daily decision queue;
-- `/app/accounts` — real account portfolio, action queue, tiers, and stages;
+- `/app/accounts` — real account portfolio, due/action/tier/stage aggregates,
+  bounded action queue, and a guarded open-in-Excel action;
 - `/app/stories` — private story, positioning, and communication inventories;
 - `/app/operations` — fixed local capabilities, production guards, and job history;
-- `/app/runs` and `/app/reports` — reviewed production E2E execution, run-scoped evidence, and sandboxed full exact reports;
+- `/app/runs` and `/app/reports` — exact scheduled/cockpit progress polling,
+  reviewed production E2E execution, run-scoped evidence, and sandboxed full
+  exact reports;
+- `/app/plan` — a prioritized next-run action plan derived from the last exact
+  run plus the durable review ledger;
 - `/app/applications` and `/app/outreach` — execution state and full-draft approval;
 - `/app/settings` — pairing, portable/existing mode, and engine-binding status;
 - `/story`, `/architecture`, and `/privacy` — product narrative, system design, and data policy.
 
-Unpaired operational routes render a hard connection gate and no company, queue,
-run, or report rows. Fictional examples remain confined to public product-story
-surfaces and code fixtures; they are never presented as an operator workspace or
-mixed with local data.
+Unpaired hosted operational routes render a hard connection gate and no company,
+queue, run, or report rows. The primary loopback UI authenticates itself through
+its same-origin local cookie. Fictional examples remain confined to public
+product-story surfaces and code fixtures; they are never presented as an
+operator workspace or mixed with local data.
 
-## Start the working product locally
+## Start the primary local product
 
-Requirements: Node.js `>=22.13.0` for the hosted UI and Python `>=3.11` for the
-dependency-free companion.
+Requirements: Node.js `>=22.13.0` for the generated UI and Python `>=3.11` for
+the dependency-free companion.
 
-Start the command center:
+Build the static application:
 
 ```bash
 npm install
-npm run dev
+npm run export:static
 ```
 
-In another terminal, from this repository root:
+Then promote the validated stage and start the companion through the guarded
+installer:
 
 ```bash
-export PYTHONPATH="$PWD/companion"
-python3 -m recruiting_companion serve
+scripts/install-operator-companion-launch-agent.sh --production-preflight
 ```
 
 The companion binds to `127.0.0.1:8765`, creates a private per-user data
-directory, and prints the path to a one-time pairing token. Open
-`http://localhost:3000/app/onboarding`, paste that token in the final step, and
-the browser exchanges it for a local bearer.
+directory, validates the promoted `static-export/`, and serves both UI and API.
+The exporter writes only `static-export.staged/`; the installer stops the old
+service under its interlock before promotion and rolls the UI generation back if
+replacement startup fails. The server verifies each requested file against the
+sealed startup inventory. In another terminal run
+`scripts/open-operator-cockpit.sh`; it captures a two-minute,
+single-use activation without printing it, then establishes the same-origin
+local cookie. The cookie persists across normal browser and companion restarts.
+No pairing token is required for this primary path.
+
+`npm run dev` remains available for web development. The hosted GitHub Pages
+build and Chrome companion retain their explicit pairing flows.
 
 See [the companion guide](companion/README.md) for the API, custom data roots,
-token rotation, source import schema, and security model.
+token rotation, source import schema, and security model. See the
+[primary local UI runbook](docs/PRIMARY_LOCAL_UI.md) for daily operation,
+progress, rebuild/restart rules, and external-agent handoff.
 
 ## Bind an existing engine
 
@@ -135,9 +164,10 @@ scripts/install-operator-companion-launch-agent.sh --dry-run
 scripts/install-operator-companion-launch-agent.sh --production-preflight
 ```
 
-The generated LaunchAgent contains no credentials or pairing tokens. See the
+The generated LaunchAgent contains no credentials or pairing tokens. Build the
+static export before installing it, then use the canonical local URL. See the
 [macOS operator setup](docs/OPERATOR_SETUP.md) for overrides, logs, inspection,
-pairing, and uninstall commands.
+hosted pairing, and uninstall commands.
 
 ## Install the Chrome companion
 
@@ -186,8 +216,9 @@ python3 -m json.tool extension/manifest.json >/dev/null
 
 The public bundle contains reviewed non-identifying aggregates and fictional
 examples. It contains no resumes, contacts, messages, credentials, signed-in
-browser state, or production artifacts. The paired app talks directly to the
-loopback companion; there is no hosted user database in this release.
+browser state, or production artifacts. The primary local app and any paired
+hosted client talk directly to the loopback companion; there is no hosted user
+database in this release.
 
 This repository supports two truthful claims:
 

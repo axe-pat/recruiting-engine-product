@@ -177,6 +177,8 @@ operator_print_config() {
   printf '%s\n' \
     "Mode: existing (fixed reviewed actions enabled; generic live-run disabled)" \
     "Bind: ${RECRUITING_ENGINE_HOST}:${RECRUITING_ENGINE_PORT}" \
+    "Primary UI: http://${RECRUITING_ENGINE_HOST}:${RECRUITING_ENGINE_PORT}/app/" \
+    "Open/activate: ${OPERATOR_PRODUCT_ROOT}/scripts/open-operator-cockpit.sh" \
     "Product root: ${OPERATOR_PRODUCT_ROOT}" \
     "Resume engine: ${RECRUITING_ENGINE_RESUME_ROOT}" \
     "Outreach engine: ${RECRUITING_ENGINE_OUTREACH_ROOT}" \

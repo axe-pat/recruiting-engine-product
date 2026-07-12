@@ -4,4 +4,4 @@ from .config import Settings
 from .service import CompanionService
 
 __all__ = ["CompanionService", "Settings"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"

@@ -135,6 +135,76 @@ export type OperatorQueueItem = {
   actions?: OperatorQueueAction[];
 };
 
+export type OperatorCurrentRunProgress = {
+  schema_version?: string;
+  status?: "running" | "complete" | "attention" | "partial" | "unavailable";
+  reason?: string;
+  selection?: "current" | "most_recent_verified" | "latest_scheduler_attempt" | "unavailable";
+  scope?: "current-snapshot" | "run-scoped";
+  is_current?: boolean;
+  run_id?: string | null;
+  phase?: { id?: string; label?: string; status?: string };
+  timestamps?: { started_at?: string | null; last_progress_at?: string | null; completed_at?: string | null; captured_at?: string | null };
+  counts?: {
+    searches_completed?: number | null;
+    searches_total?: number | null;
+    items_discovered?: number | null;
+    source_families_total?: number | null;
+    source_families_successful?: number | null;
+    source_families_attention?: number | null;
+    raw_total?: number | null;
+    kept_total?: number | null;
+    decision_total?: number | null;
+    pending_review_count?: number | null;
+    scoring_attempted?: number | null;
+    scoring_errors?: number | null;
+    accepted_for_write?: number | null;
+  };
+  evidence?: Array<{ kind?: string; state?: string; path?: string; sha256?: string; size_bytes?: number; binding?: string }>;
+};
+
+export type OperatorNextRunPlan = {
+  schema_version?: string;
+  status?: "available" | "partial" | "unavailable";
+  reason?: string;
+  scope?: "derived-plan";
+  basis_run_id?: string | null;
+  basis_run_status?: string | null;
+  basis_completed_at?: string | null;
+  current_run_in_progress?: boolean;
+  items?: Array<{
+    id?: string;
+    category?: string;
+    priority?: string | number;
+    title?: string;
+    reason?: string;
+    count?: number | null;
+    evidence?: { kind?: string; run_id?: string; source?: string; status?: string; lane?: string; review_state?: string; sha256?: string };
+  }>;
+  items_returned?: number;
+  items_total?: number;
+  truncated?: boolean;
+  limit?: number;
+};
+
+export type OperatorAccountTracker = {
+  schema_version?: string;
+  status?: "available" | "busy" | "partial" | "unavailable";
+  reason?: string;
+  scope?: "current-snapshot";
+  summary?: Record<string, unknown> | null;
+  evidence?: { state?: string; path?: string; sha256?: string; size_bytes?: number } | null;
+  open_action?: {
+    command_id?: string;
+    label?: string;
+    status?: string;
+    reason?: string;
+    confirmation_phrase?: string;
+    parameters?: Record<string, unknown>;
+    asynchronous?: boolean;
+  };
+};
+
 export type OperatorOverview = {
   schema_version?: string;
   generated_at?: string;
@@ -160,6 +230,9 @@ export type OperatorOverview = {
     story_comms?: Record<string, unknown>;
     daily_reports?: Record<string, unknown>;
     source_metrics?: Record<string, unknown>;
+    current_run_progress?: OperatorCurrentRunProgress;
+    next_run_plan?: OperatorNextRunPlan;
+    account_tracker?: OperatorAccountTracker;
   };
   recent_jobs?: OperatorJob[];
   review_queue?: {
@@ -173,6 +246,16 @@ export type OperatorOverview = {
     lanes?: OperatorReviewLane[];
     recent_reviews?: OperatorReview[];
     review_counts?: Record<string, number>;
+    recent_reviews_items_returned?: number;
+    recent_reviews_items_total?: number;
+    recent_reviews_truncated?: boolean;
+    recent_reviews_limit?: number;
+    recent_reviews_meta?: {
+      items_returned?: number;
+      items_total?: number;
+      truncated?: boolean;
+      limit?: number;
+    };
     execution_boundary?: string;
   };
 };

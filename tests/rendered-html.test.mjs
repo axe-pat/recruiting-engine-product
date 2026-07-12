@@ -78,7 +78,7 @@ test("server-renders a truthful connection gate before operational data", async 
 });
 
 test("server-renders the private operator cockpit routes without private data", async () => {
-  for (const path of ["/app/accounts", "/app/stories", "/app/operations"]) {
+  for (const path of ["/app/accounts", "/app/plan", "/app/stories", "/app/operations"]) {
     const response = await render(path);
     assert.equal(response.status, 200);
     const html = await response.text();

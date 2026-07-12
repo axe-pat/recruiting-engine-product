@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import sqlite3
+import stat
 import subprocess
 import threading
 import xml.etree.ElementTree as ET
@@ -21,7 +22,13 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .config import Settings
 from .db import Database
-from .existing_adapter import ExistingEngineAdapter
+from .existing_adapter import (
+    ExistingEngineAdapter,
+    MutableSnapshotBusy,
+    MutableSnapshotCapture,
+    MutableSnapshotChanged,
+    MutableSnapshotUnavailable,
+)
 from .service import ConflictError, NotFoundError, ValidationError, new_id, utc_now
 
 
@@ -34,11 +41,13 @@ _MAX_XLSX_EXPANDED_BYTES = 256 * 1024 * 1024
 _MAX_REPORT_HTML_BYTES = 5 * 1024 * 1024
 _OPERATOR_JOB_LIMIT = 100
 _QUEUE_ITEM_LIMIT = 100
+_REPORT_ITEM_LIMIT = 20
 _ACCOUNT_ACTION_LIMIT = 50
 _STORY_ITEM_LIMIT = 50
 _REVIEW_ITEM_LIMIT = 100
 _REVIEW_TARGET_LIMIT = 50
 _REVIEW_TTL_HOURS = 24
+_NEXT_RUN_PLAN_LIMIT = 30
 _PREFLIGHT_CONFIRMATION = "RUN_PRODUCTION_PREFLIGHT"
 _REQUIRED_LOCKS = {
     "scheduler",
@@ -562,7 +571,11 @@ class OperatorBackend:
         self.db.initialize()
         self.adapter = ExistingEngineAdapter(settings)
 
-    def capabilities(self) -> dict[str, Any]:
+    def capabilities(
+        self,
+        *,
+        _include_internal: bool = False,
+    ) -> dict[str, Any]:
         adapter_status = self.adapter.status()
         commands = []
         for command_id, definition in _COMMAND_CATALOG.items():
@@ -639,7 +652,7 @@ class OperatorBackend:
         command_states = {
             command["command_id"]: command["status"] for command in commands
         }
-        return {
+        projection = {
             "schema_version": "1.1",
             "mode": "existing" if adapter_status["configured"] else "portable",
             "data_class": "local-private",
@@ -667,10 +680,16 @@ class OperatorBackend:
             "production_guard": adapter_status["production_guard"],
             "commands": commands,
         }
+        if _include_internal:
+            projection["_verified_run_count"] = _bounded_operator_count(
+                adapter_status.get("verified_run_count")
+            )
+        return projection
 
     def overview(self) -> dict[str, Any]:
-        capability = self.capabilities()
-        assets = self.assets()
+        capability = self.capabilities(_include_internal=True)
+        review_queue = self.review_queue()
+        assets = self.assets(capability=capability, review_queue=review_queue)
         return {
             "schema_version": "1.1",
             "generated_at": utc_now(),
@@ -713,7 +732,16 @@ class OperatorBackend:
             },
             "assets": assets,
             "recent_jobs": self.list_jobs(limit=10),
-            "review_queue": self.review_queue(),
+            "review_queue": review_queue,
+        }
+
+    def progress(self) -> dict[str, Any]:
+        """Return the lightweight, polling-safe operator progress surface."""
+        return {
+            "schema_version": "1.0",
+            "generated_at": utc_now(),
+            "current_run_progress": self.adapter.run_progress(),
+            "recent_jobs": self.list_jobs(limit=10),
         }
 
     def exact_report_html(self, run_id: str) -> dict[str, Any]:
@@ -768,83 +796,229 @@ class OperatorBackend:
             "content_type": "text/html; charset=utf-8",
         }
 
-    def assets(self) -> dict[str, Any]:
-        run_projections = self.adapter.verified_run_projections(limit=20)
+    def assets(
+        self,
+        *,
+        capability: dict[str, Any] | None = None,
+        review_queue: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        run_projections = self.adapter.verified_run_projections(
+            limit=_REPORT_ITEM_LIMIT
+        )
         lock_states = self.adapter.lock_states()
-        locks_free = self._all_locks_free(lock_states)
+        capability_projection = capability or self.capabilities(
+            _include_internal=True
+        )
+        command_capabilities = {
+            item["command_id"]: item
+            for item in capability_projection.get("commands", [])
+            if isinstance(item, dict) and isinstance(item.get("command_id"), str)
+        }
+        review_projection = review_queue or self.review_queue()
+        run_progress = self.adapter.run_progress(
+            verified_runs=run_projections,
+            locks=lock_states,
+        )
 
         workbooks: dict[str, Any]
         current_queue: dict[str, Any]
-        if locks_free:
-            current_workspace = self.adapter.snapshot()["current_workspace"]
-            workbooks = self._workbook_assets()
-            current_queue = self._current_apply_queue_assets(current_workspace)
-            ending_locks = self.adapter.lock_states()
-            if not self._all_locks_free(ending_locks):
-                workbooks = {
-                    "status": "busy",
-                    "scope": "current-snapshot",
-                    "reason": (
-                        "Engine lock state changed during workbook capture; "
-                        "aggregates were discarded."
-                    ),
-                    "locks": ending_locks,
-                }
-                current_queue = {
-                    "status": "busy",
-                    "scope": "current-snapshot",
-                    "reason": (
-                        "Engine lock state changed during queue capture; rows "
-                        "were discarded."
-                    ),
-                    "locks": ending_locks,
-                    "items": [],
-                    "items_returned": 0,
-                    "truncated": False,
-                }
-        else:
-            blocked_status = (
-                "busy" if any(state == "busy" for state in lock_states.values())
-                else "unavailable"
-            )
+        story_comms: dict[str, Any]
+        capture_started_at = utc_now()
+        try:
+            with self.adapter.mutable_snapshot_capture() as capture:
+                self._track_mutable_inventory_roots(capture)
+                current_workspace = self.adapter.current_workspace_snapshot(
+                    captured_at=capture_started_at,
+                    capture=capture,
+                )
+                workbooks = self._workbook_assets(capture=capture)
+                story_comms = self._story_comms_assets(capture=capture)
+                current_queue = self._current_apply_queue_assets(
+                    current_workspace,
+                    command_capabilities=command_capabilities,
+                    capture=capture,
+                )
+            mutable_capture = {
+                "status": "available",
+                "scope": "current-snapshot",
+                "consistency": "stable-at-capture",
+                "transactional": False,
+                "captured_at": capture_started_at,
+                "reason": (
+                    "All projected files and inventory identities were unchanged "
+                    "when the noninterfering capture finalized."
+                ),
+            }
+        except MutableSnapshotBusy as error:
+            blocked_status = "busy"
+            reason = str(error)
+            mutable_capture = {
+                "status": blocked_status,
+                "scope": "current-snapshot",
+                "consistency": "not-captured",
+                "transactional": False,
+                "captured_at": capture_started_at,
+                "reason": reason,
+            }
             workbooks = {
                 "status": blocked_status,
                 "scope": "current-snapshot",
-                "reason": (
-                    "Workbook aggregates require every engine and adapter lock "
-                    "to be explicitly free."
-                ),
-                "locks": lock_states,
+                "consistency": "not-captured",
+                "reason": reason,
             }
             current_queue = {
                 "status": blocked_status,
                 "scope": "current-snapshot",
-                "reason": (
-                    "Queue projection requires every engine and adapter lock "
-                    "to be explicitly free."
-                ),
-                "locks": lock_states,
+                "consistency": "not-captured",
+                "reason": reason,
                 "items": [],
                 "items_returned": 0,
+                "items_total": 0,
                 "truncated": False,
             }
+            story_comms = {
+                "status": blocked_status,
+                "scope": "current-snapshot",
+                "consistency": "not-captured",
+                "reason": reason,
+                "stories": {"status": blocked_status, "items": []},
+                "communications": {"status": blocked_status},
+            }
+        except MutableSnapshotUnavailable as error:
+            blocked_status = "unavailable"
+            reason = str(error)
+            mutable_capture = {
+                "status": blocked_status,
+                "scope": "current-snapshot",
+                "consistency": "not-captured",
+                "transactional": False,
+                "captured_at": capture_started_at,
+                "reason": reason,
+            }
+            workbooks = {
+                "status": blocked_status,
+                "scope": "current-snapshot",
+                "consistency": "not-captured",
+                "reason": reason,
+            }
+            current_queue = {
+                "status": blocked_status,
+                "scope": "current-snapshot",
+                "consistency": "not-captured",
+                "reason": reason,
+                "items": [],
+                "items_returned": 0,
+                "items_total": 0,
+                "truncated": False,
+            }
+            story_comms = {
+                "status": blocked_status,
+                "scope": "current-snapshot",
+                "consistency": "not-captured",
+                "reason": reason,
+                "stories": {"status": blocked_status, "items": []},
+                "communications": {"status": blocked_status},
+            }
+        except (MutableSnapshotChanged, OSError, ValueError) as error:
+            blocked_status = "partial"
+            reason = (
+                "Mutable artifacts changed during capture; every mutable "
+                f"projection was discarded ({type(error).__name__})."
+            )
+            mutable_capture = {
+                "status": blocked_status,
+                "scope": "current-snapshot",
+                "consistency": "changed-during-capture",
+                "transactional": False,
+                "captured_at": capture_started_at,
+                "reason": reason,
+            }
+            workbooks = {
+                "status": blocked_status,
+                "scope": "current-snapshot",
+                "consistency": "changed-during-capture",
+                "reason": reason,
+            }
+            current_queue = self._current_apply_queue_assets(
+                {
+                    "status": blocked_status,
+                    "consistency": "changed-during-capture",
+                    "application_queue": None,
+                    "reasons": [reason],
+                    "evidence": {},
+                },
+                command_capabilities=command_capabilities,
+                capture=None,
+            )
+            current_queue.update({
+                "status": blocked_status,
+                "scope": "current-snapshot",
+                "consistency": "changed-during-capture",
+                "reason": reason,
+            })
+            story_comms = {
+                "status": blocked_status,
+                "scope": "current-snapshot",
+                "consistency": "changed-during-capture",
+                "reason": reason,
+                "stories": {"status": blocked_status, "items": []},
+                "communications": {"status": blocked_status},
+            }
 
-        reports = self._report_assets(run_projections)
+        verified_run_count = _bounded_operator_count(
+            capability_projection.get("_verified_run_count")
+        )
+        reports = self._report_assets(
+            run_projections,
+            items_total=verified_run_count,
+        )
         sources = self._source_assets(run_projections)
         return {
-            "schema_version": "1.0",
+            "schema_version": "1.1",
             "generated_at": utc_now(),
+            "mutable_capture": mutable_capture,
             "workbooks": workbooks,
             "current_apply_queue": current_queue,
-            "story_comms": self._story_comms_assets(),
+            "story_comms": story_comms,
             "daily_reports": reports,
             "source_metrics": sources,
+            "current_run_progress": run_progress,
+            "next_run_plan": self._next_run_plan(
+                run_projections,
+                current_progress=run_progress,
+                review_queue=review_projection,
+            ),
+            "account_tracker": self._account_tracker_surface(
+                workbooks,
+                open_action=command_capabilities.get("open.account_tracker", {}),
+            ),
         }
 
     def review_queue(self) -> dict[str, Any]:
+        self._expire_reviews()
         targets = self.review_targets()
         reviews = self.list_reviews(limit=25)
-        counts = Counter(str(review.get("state") or "unknown") for review in reviews)
+        with self.db.connect() as connection:
+            state_rows = connection.execute(
+                """
+                SELECT state, COUNT(*) AS item_count
+                FROM operator_reviews
+                WHERE user_id = ?
+                GROUP BY state
+                """,
+                (self.settings.user_id,),
+            ).fetchall()
+        counts = {
+            str(row["state"] or "unknown"): int(row["item_count"] or 0)
+            for row in state_rows
+        }
+        review_total = sum(counts.values())
+        recent_meta = {
+            "items_returned": len(reviews),
+            "items_total": review_total,
+            "truncated": review_total > len(reviews),
+            "limit": 25,
+        }
         return {
             "schema_version": "1.0",
             "generated_at": utc_now(),
@@ -857,6 +1031,11 @@ class OperatorBackend:
             "lanes": targets["lanes"],
             "recent_reviews": reviews,
             "review_counts": dict(sorted(counts.items())),
+            "recent_reviews_items_returned": recent_meta["items_returned"],
+            "recent_reviews_items_total": recent_meta["items_total"],
+            "recent_reviews_truncated": recent_meta["truncated"],
+            "recent_reviews_limit": recent_meta["limit"],
+            "recent_reviews_meta": recent_meta,
             "execution_boundary": (
                 "Review and approval are durable but never execute by themselves. "
                 "A separate typed confirmation can run only an installed fixed "
@@ -2389,27 +2568,63 @@ class OperatorBackend:
         now = utc_now()
         initial_status = "queued" if capability["status"] == "available" else "blocked"
         result_code = "" if initial_status == "queued" else f"capability_{capability['status']}"
-        with self.db.transaction() as connection:
-            connection.execute(
-                """
-                INSERT INTO operator_jobs (
-                    id, user_id, command_id, parameters_json, status, requested_scope,
-                    requested_at, confirmation_valid, result_code, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job_id,
-                    self.settings.user_id,
-                    command_id,
-                    json.dumps(safe_parameters, sort_keys=True),
-                    initial_status,
-                    requested_scope,
-                    now,
-                    int(bool(expected_confirmation)),
-                    result_code,
-                    now,
-                ),
+        lock_path = self.settings.adapter_mutation_lock_path
+        descriptor: int | None = None
+        try:
+            flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(
+                os,
+                "O_CLOEXEC",
+                0,
             )
+            descriptor = os.open(lock_path, flags)
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("operator admission lock is not regular")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise ConflictError(
+                    "Operator job admission is temporarily paused for local "
+                    "maintenance or an exclusive engine action; retry after the "
+                    "cockpit is available."
+                ) from error
+            with self.db.transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO operator_jobs (
+                        id, user_id, command_id, parameters_json, status, requested_scope,
+                        requested_at, confirmation_valid, result_code, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        self.settings.user_id,
+                        command_id,
+                        json.dumps(safe_parameters, sort_keys=True),
+                        initial_status,
+                        requested_scope,
+                        now,
+                        int(bool(expected_confirmation)),
+                        result_code,
+                        now,
+                    ),
+                )
+        except ConflictError:
+            raise
+        except OSError as error:
+            raise ConflictError(
+                "Operator job admission could not establish the local "
+                "maintenance guard; no job was queued."
+            ) from error
+        finally:
+            if descriptor is not None:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
         if initial_status == "blocked":
             return self.get_job(job_id)
         if command_id == "production.preflight":
@@ -5090,14 +5305,40 @@ class OperatorBackend:
             ),
         }
 
+    def _track_mutable_inventory_roots(
+        self,
+        capture: MutableSnapshotCapture,
+    ) -> None:
+        if self.settings.resumegen_root:
+            for path in (
+                self.settings.resumegen_root
+                / "apps"
+                / "Apply queues"
+                / "current_apply_queue",
+                self.settings.resumegen_root / "docs" / "career_workbench",
+                self.settings.resumegen_root / "cover_letters" / "story_bank",
+            ):
+                capture.track_tree(path)
+        if self.settings.outreach_root:
+            capture.track_tree(
+                self.settings.outreach_root / "workspace" / "comms_learning"
+            )
+
     def _current_apply_queue_assets(
         self,
         current_workspace: dict[str, Any],
+        *,
+        command_capabilities: dict[str, dict[str, Any]] | None = None,
+        capture: MutableSnapshotCapture | None = None,
     ) -> dict[str, Any]:
         summary = current_workspace.get("application_queue")
         result: dict[str, Any] = {
             "status": current_workspace.get("status", "unavailable"),
             "scope": "current-snapshot",
+            "consistency": current_workspace.get(
+                "consistency", "stable-at-capture" if capture else "not-captured"
+            ),
+            "transactional": False,
             "summary": summary if isinstance(summary, dict) else None,
             "reasons": list(current_workspace.get("reasons", [])),
             "evidence": {
@@ -5135,9 +5376,9 @@ class OperatorBackend:
                 queue_root / "priority_order.json",
                 expect="file",
             )
-            first_manifest = _read_bounded_bytes(manifest_path)
-            priority_content = _read_bounded_bytes(priority_path)
-            second_manifest = _read_bounded_bytes(manifest_path)
+            first_manifest = _read_bounded_bytes(manifest_path, capture=capture)
+            priority_content = _read_bounded_bytes(priority_path, capture=capture)
+            second_manifest = _read_bounded_bytes(manifest_path, capture=capture)
             if hashlib.sha256(first_manifest).digest() != hashlib.sha256(
                 second_manifest
             ).digest():
@@ -5148,11 +5389,15 @@ class OperatorBackend:
             expected_count = summary.get("priority_item_count")
             if isinstance(expected_count, int) and expected_count != len(priority):
                 raise ValueError("queue summary and row count do not match")
-            application_commands = {
+            available_commands = command_capabilities or {
                 item["command_id"]: item
                 for item in self.capabilities()["commands"]
-                if item["command_id"]
-                in {
+                if isinstance(item, dict)
+                and isinstance(item.get("command_id"), str)
+            }
+            application_commands = {
+                command_id: available_commands.get(command_id, {})
+                for command_id in {
                     "application.resume.generate",
                     "application.apply_packet.build",
                     "open.application_folder",
@@ -5224,25 +5469,33 @@ class OperatorBackend:
             )
         return actions
 
-    def _workbook_assets(self) -> dict[str, Any]:
+    def _workbook_assets(
+        self,
+        *,
+        capture: MutableSnapshotCapture | None = None,
+    ) -> dict[str, Any]:
         if not self.settings.resumegen_root or not self.settings.outreach_root:
             return {
                 "status": "unavailable",
                 "scope": "current-snapshot",
+                "consistency": "not-captured",
+                "transactional": False,
                 "reason": "Existing engine roots are not configured.",
             }
         try:
             resume_path = self.settings.resumegen_root / "discovery" / "jobs.xlsx"
             account_path = self.settings.outreach_root / "workspace" / "account_tracker.xlsx"
             resume_sheets, resume_evidence = _read_xlsx(
-                resume_path, self.settings.resumegen_root
+                resume_path, self.settings.resumegen_root, capture=capture
             )
             account_sheets, account_evidence = _read_xlsx(
-                account_path, self.settings.outreach_root
+                account_path, self.settings.outreach_root, capture=capture
             )
             return {
                 "status": "available",
                 "scope": "current-snapshot",
+                "consistency": "stable-at-capture" if capture else "best-effort",
+                "transactional": False,
                 "resume_workbook": _resume_workbook_projection(
                     resume_sheets, resume_evidence
                 ),
@@ -5254,10 +5507,517 @@ class OperatorBackend:
             return {
                 "status": "unavailable",
                 "scope": "current-snapshot",
+                "consistency": "not-captured",
+                "transactional": False,
                 "reason": f"Workbook aggregate failed closed: {type(error).__name__}",
             }
 
-    def _story_comms_assets(self) -> dict[str, Any]:
+    def _next_run_plan(
+        self,
+        run_projections: list[dict[str, Any]],
+        *,
+        current_progress: dict[str, Any],
+        review_queue: dict[str, Any],
+    ) -> dict[str, Any]:
+        current_running = bool(
+            current_progress.get("is_current")
+            and current_progress.get("status")
+            in {"running", "attention", "partial"}
+        )
+        latest = run_projections[-1] if run_projections else None
+        run_id = str(latest.get("run_id") or "") if latest else ""
+        current_items: list[dict[str, Any]] = []
+        current_counts = (
+            current_progress.get("counts")
+            if isinstance(current_progress.get("counts"), dict)
+            else {}
+        )
+        current_attempted = _bounded_operator_count(
+            current_counts.get("scoring_attempted")
+        )
+        current_scoring_errors = _bounded_operator_count(
+            current_counts.get("scoring_errors")
+        )
+        if (
+            current_running
+            and current_attempted
+            and current_scoring_errors is not None
+            and current_scoring_errors >= current_attempted
+        ):
+            current_scoring_sha = ""
+            current_evidence = current_progress.get("evidence")
+            bounded_evidence = (
+                current_evidence if isinstance(current_evidence, list) else []
+            )
+            for item in bounded_evidence:
+                if not isinstance(item, dict) or item.get("kind") != "linkedin_scored":
+                    continue
+                candidate = item.get("sha256")
+                if isinstance(candidate, str) and re.fullmatch(
+                    r"[0-9a-f]{64}", candidate
+                ):
+                    current_scoring_sha = candidate
+                    break
+            raw_current_run_id = current_progress.get("run_id")
+            current_run_id = (
+                raw_current_run_id
+                if isinstance(raw_current_run_id, str)
+                and re.fullmatch(r"\d{8}-\d{6}", raw_current_run_id)
+                else ""
+            )
+            item_evidence: dict[str, Any] = {
+                "kind": "exact_active_scoring",
+                "source": "linkedin",
+                "status": "failed_all_scoring",
+                "sha256": current_scoring_sha,
+            }
+            if current_run_id:
+                item_evidence["run_id"] = current_run_id
+            current_run_context = f" for {current_run_id}" if current_run_id else ""
+            current_items.append(
+                {
+                    "id": "current_source:linkedin_scoring",
+                    "category": "source_recovery",
+                    "priority": "blocker",
+                    "title": "Restore scoring capacity before the next run",
+                    "reason": (
+                        f"Exact active-run evidence{current_run_context} reports "
+                        f"{current_scoring_errors} errors across all "
+                        f"{current_attempted} fresh scoring attempts."
+                    ),
+                    "count": current_scoring_errors,
+                    "evidence": item_evidence,
+                }
+            )
+
+        review_items: list[dict[str, Any]] = []
+        review_counts = (
+            review_queue.get("review_counts")
+            if isinstance(review_queue.get("review_counts"), dict)
+            else {}
+        )
+        review_presentations = {
+            "pending": ("high", "Review pending operator actions"),
+            "reviewed": ("high", "Approve or revoke reviewed actions"),
+            "approved": ("normal", "Execute or revoke approved actions"),
+        }
+        for review_state, (priority, title) in review_presentations.items():
+            count = _bounded_operator_count(review_counts.get(review_state))
+            if not count:
+                continue
+            review_evidence: dict[str, Any] = {
+                "kind": "current_review_ledger",
+                "review_state": review_state,
+            }
+            review_items.append(
+                {
+                    "id": f"review_queue:{review_state}",
+                    "category": "review_queue",
+                    "priority": priority,
+                    "title": title,
+                    "reason": (
+                        f"The current durable operator ledger has {count} "
+                        f"{review_state} review{'s' if count != 1 else ''}."
+                    ),
+                    "count": count,
+                    "evidence": review_evidence,
+                }
+            )
+
+        if latest is None:
+            items = current_items + review_items
+            total = len(items)
+            if items:
+                evidence_kinds = []
+                if current_items:
+                    evidence_kinds.append("exact active-run scoring evidence")
+                if review_items:
+                    evidence_kinds.append("the current durable review ledger")
+                return {
+                    "schema_version": "1.0",
+                    "status": "partial",
+                    "reason": (
+                        "No fully verified exact terminal run is available yet; "
+                        "this provisional plan is grounded in "
+                        + " and ".join(evidence_kinds)
+                        + "."
+                    ),
+                    "scope": "derived-plan",
+                    "basis_run_id": None,
+                    "basis_run_status": None,
+                    "basis_completed_at": None,
+                    "current_run_in_progress": current_running,
+                    "items": items[:_NEXT_RUN_PLAN_LIMIT],
+                    "items_returned": min(total, _NEXT_RUN_PLAN_LIMIT),
+                    "items_total": total,
+                    "truncated": total > _NEXT_RUN_PLAN_LIMIT,
+                    "limit": _NEXT_RUN_PLAN_LIMIT,
+                }
+            return {
+                "schema_version": "1.0",
+                "status": "unavailable",
+                "reason": (
+                    "No fully verified exact run or grounded current/review "
+                    "evidence is available as a next-run plan basis."
+                ),
+                "scope": "derived-plan",
+                "basis_run_id": None,
+                "basis_run_status": None,
+                "basis_completed_at": None,
+                "current_run_in_progress": current_running,
+                "items": [],
+                "items_returned": 0,
+                "items_total": 0,
+                "truncated": False,
+                "limit": _NEXT_RUN_PLAN_LIMIT,
+            }
+
+        run_status = str(latest.get("status") or "attention")
+        evidence = latest.get("evidence")
+        exact_evidence = evidence if isinstance(evidence, dict) else {}
+
+        def evidence_sha(kind: str) -> str:
+            item = exact_evidence.get(kind)
+            value = item.get("sha256") if isinstance(item, dict) else ""
+            return (
+                value
+                if isinstance(value, str)
+                and re.fullmatch(r"[0-9a-f]{64}", value)
+                else ""
+            )
+
+        items = list(current_items)
+        attention_sources = 0
+        for source in latest.get("sources", []):
+            if not isinstance(source, dict):
+                continue
+            source_id = str(source.get("source") or "")
+            source_status = str(source.get("status") or "not_reported")
+            if source_id not in _JOB_SOURCES and source_id not in {
+                "linkedin",
+                "handshake",
+                "jobspy",
+                "startup_sources",
+                "resume_generator_app_queue",
+                "track_2",
+            }:
+                continue
+            if not _operator_source_requires_attention(source_status):
+                continue
+            attention_sources += 1
+            safe_source = source_id.replace("_", " ").title()
+            items.append(
+                {
+                    "id": f"source:{source_id}",
+                    "category": "source_recovery",
+                    "priority": "blocker",
+                    "title": f"Resolve {safe_source} before the next run",
+                    "reason": (
+                        f"Exact run {run_id} reported {source_id} as {source_status}."
+                    ),
+                    "count": 1,
+                    "evidence": {
+                        "kind": "exact_source_status",
+                        "run_id": run_id,
+                        "source": source_id,
+                        "status": source_status,
+                        "sha256": evidence_sha("daily_manifest"),
+                    },
+                }
+            )
+
+        reporting_consistency = _bounded_reporting_consistency(
+            latest.get("reporting_consistency")
+        )
+        reporting_mismatch_count = reporting_consistency["mismatch_count"]
+        if reporting_mismatch_count:
+            categories = reporting_consistency["categories"]
+            category_summary = ", ".join(
+                f"{name.replace('_', ' ')} {count}"
+                for name, count in categories.items()
+            )
+            items.append(
+                {
+                    "id": "run:reporting_consistency",
+                    "category": "run_review",
+                    "priority": "blocker",
+                    "title": "Reconcile manifest and report source totals",
+                    "reason": (
+                        f"Exact run {run_id} has {reporting_mismatch_count} "
+                        "aggregate source reporting mismatch"
+                        f"{'es' if reporting_mismatch_count != 1 else ''} across "
+                        f"{reporting_consistency['mismatch_source_count']} required "
+                        f"source{'s' if reporting_consistency['mismatch_source_count'] != 1 else ''}"
+                        + (f" ({category_summary})." if category_summary else ".")
+                    ),
+                    "count": reporting_mismatch_count,
+                    "evidence": {
+                        "kind": "exact_cross_artifact_source_consistency",
+                        "run_id": run_id,
+                        "status": "mismatch",
+                        "sha256": evidence_sha("outreach_report"),
+                        "manifest_sha256": evidence_sha("daily_manifest"),
+                    },
+                }
+            )
+
+        failure_count = _bounded_operator_count(latest.get("failure_count"))
+        if failure_count and not attention_sources:
+            items.append(
+                {
+                    "id": "run:failure_evidence",
+                    "category": "run_review",
+                    "priority": "blocker",
+                    "title": "Review the exact failed-run evidence",
+                    "reason": (
+                        f"Exact run {run_id} recorded {failure_count} terminal "
+                        "failure entr{'y' if failure_count == 1 else 'ies'}."
+                    ),
+                    "count": failure_count,
+                    "evidence": {
+                        "kind": "exact_run_summary",
+                        "run_id": run_id,
+                        "status": run_status,
+                        "sha256": evidence_sha("summary"),
+                    },
+                }
+            )
+
+        report = latest.get("report") if isinstance(latest.get("report"), dict) else {}
+        report_status = str(report.get("run_status") or "not_reported")
+        track_2_status = str(report.get("track_2_status") or "not_reported")
+        if report_status not in {"completed", "failed_or_incomplete", "not_reported"}:
+            report_status = "not_reported"
+        if track_2_status not in {
+            "completed",
+            "ran",
+            "skipped",
+            "failed",
+            "partial_failed",
+            "timed_out",
+            "cancelled",
+            "not_reported",
+        }:
+            track_2_status = "not_reported"
+        if (
+            run_status != "complete"
+            and not attention_sources
+            and not failure_count
+            and (
+                report_status != "completed"
+                or track_2_status
+                in {
+                    "failed",
+                    "partial_failed",
+                    "timed_out",
+                    "cancelled",
+                    "not_reported",
+                }
+            )
+        ):
+            items.append(
+                {
+                    "id": "run:attention_report",
+                    "category": "run_review",
+                    "priority": "blocker",
+                    "title": "Resolve the prior run's exact report warning",
+                    "reason": (
+                        f"Exact run {run_id} reports run status {report_status} "
+                        f"and Track 2 status {track_2_status}."
+                    ),
+                    "count": 1,
+                    "evidence": {
+                        "kind": "exact_outreach_report",
+                        "run_id": run_id,
+                        "status": report_status,
+                        "sha256": evidence_sha("outreach_report"),
+                    },
+                }
+            )
+
+        queue = latest.get("queue") if isinstance(latest.get("queue"), dict) else {}
+        parts = (
+            queue.get("decision_total_parts")
+            if isinstance(queue.get("decision_total_parts"), dict)
+            else {}
+        )
+        lane_presentations = {
+            "application_plus_outreach": (
+                "application_queue",
+                "high",
+                "Review application + outreach candidates",
+            ),
+            "application_only": (
+                "application_queue",
+                "high",
+                "Review application-only candidates",
+            ),
+            "outreach_only_today": (
+                "outreach_queue",
+                "high",
+                "Review outreach-only candidates",
+            ),
+            "relationship_buffer": (
+                "relationship_queue",
+                "normal",
+                "Work the relationship buffer",
+            ),
+            "follow_up": (
+                "outreach_queue",
+                "normal",
+                "Review queued follow-ups",
+            ),
+        }
+        for lane, (category, priority, title) in lane_presentations.items():
+            count = _bounded_operator_count(parts.get(lane))
+            if not count:
+                continue
+            items.append(
+                {
+                    "id": f"action_queue:{lane}",
+                    "category": category,
+                    "priority": priority,
+                    "title": title,
+                    "reason": (
+                        f"The exact action queue for run {run_id} contains "
+                        f"{count} {lane} item{'s' if count != 1 else ''}."
+                    ),
+                    "count": count,
+                    "evidence": {
+                        "kind": "exact_action_queue_lane",
+                        "run_id": run_id,
+                        "lane": lane,
+                        "sha256": evidence_sha("action_queue"),
+                    },
+                }
+            )
+
+        items.extend(review_items)
+
+        total = len(items)
+        reason = ""
+        status = "available"
+        if current_running:
+            status = "partial"
+            reason = (
+                "A current run is still active; this plan is grounded in the "
+                f"prior exact terminal run {run_id} and current durable reviews."
+            )
+        elif not items:
+            reason = (
+                "The latest exact run and current durable review ledger expose "
+                "no queued next-run actions."
+            )
+        return {
+            "schema_version": "1.0",
+            "status": status,
+            "reason": reason,
+            "scope": "derived-plan",
+            "basis_run_id": run_id,
+            "basis_run_status": run_status,
+            "basis_completed_at": latest.get("completed_at"),
+            "current_run_in_progress": current_running,
+            "items": items[:_NEXT_RUN_PLAN_LIMIT],
+            "items_returned": min(total, _NEXT_RUN_PLAN_LIMIT),
+            "items_total": total,
+            "truncated": total > _NEXT_RUN_PLAN_LIMIT,
+            "limit": _NEXT_RUN_PLAN_LIMIT,
+        }
+
+    @staticmethod
+    def _account_tracker_surface(
+        workbooks: dict[str, Any],
+        *,
+        open_action: dict[str, Any],
+    ) -> dict[str, Any]:
+        action = {
+            "command_id": "open.account_tracker",
+            "label": str(open_action.get("label") or "Open account tracker"),
+            "status": str(open_action.get("status") or "unavailable"),
+            "reason": str(open_action.get("reason") or ""),
+            "confirmation_phrase": str(
+                open_action.get("confirmation_phrase")
+                or _COMMAND_CATALOG["open.account_tracker"]["confirmation"]
+            ),
+            "parameters": {},
+            "asynchronous": bool(open_action.get("asynchronous", False)),
+        }
+        workbook_status = str(workbooks.get("status") or "unavailable")
+        if workbook_status == "busy" and action["status"] == "available":
+            action["status"] = "unavailable"
+            action["reason"] = (
+                "Account tracker opening requires the current engine lock "
+                "snapshot to remain free."
+            )
+        tracker = workbooks.get("account_tracker")
+        if workbook_status != "available" or not isinstance(tracker, dict):
+            return {
+                "schema_version": "1.0",
+                "status": workbook_status,
+                "reason": str(
+                    workbooks.get("reason")
+                    or "Account tracker aggregates are unavailable."
+                ),
+                "scope": "current-snapshot",
+                "consistency": workbooks.get("consistency", "not-captured"),
+                "transactional": False,
+                "summary": None,
+                "evidence": None,
+                "open_action": action,
+            }
+        summary = {
+            "account_count": _bounded_operator_count(tracker.get("account_count")),
+            "action_count": _bounded_operator_count(tracker.get("action_count")),
+            "actions_due_now": _bounded_operator_count(
+                tracker.get("actions_due_now")
+            ),
+            "due_counts": _bounded_numeric_mapping(
+                tracker.get("due_counts"),
+                allowed={"overdue", "due_today", "upcoming", "undated"},
+            ),
+            "tier_counts": _bounded_numeric_mapping(
+                tracker.get("tier_counts"), allowed={*_ACCOUNT_TIERS, "other"}
+            ),
+            "stage_counts": _bounded_numeric_mapping(
+                tracker.get("stage_counts"), allowed={*_ACCOUNT_STAGES, "other"}
+            ),
+            "action_type_counts": _bounded_numeric_mapping(
+                tracker.get("action_type_counts"),
+                allowed={*_ACCOUNT_ACTIONS, "other"},
+            ),
+            "activity_totals": _bounded_numeric_mapping(
+                tracker.get("activity_totals"),
+                allowed={
+                    "People Mapped",
+                    "Email Contacts",
+                    "Invites Sent",
+                    "Accepted",
+                    "Replies",
+                    "Coffee Chats",
+                    "Advocates",
+                },
+            ),
+            "people_mapped": _bounded_operator_count(tracker.get("people_mapped")),
+            "score_summary": _bounded_score_summary(tracker.get("score_summary")),
+        }
+        evidence = tracker.get("evidence")
+        return {
+            "schema_version": "1.0",
+            "status": "available",
+            "reason": "",
+            "scope": "current-snapshot",
+            "consistency": workbooks.get("consistency", "stable-at-capture"),
+            "transactional": False,
+            "summary": summary,
+            "evidence": evidence if isinstance(evidence, dict) else None,
+            "open_action": action,
+        }
+
+    def _story_comms_assets(
+        self,
+        *,
+        capture: MutableSnapshotCapture | None = None,
+    ) -> dict[str, Any]:
         categories: dict[str, Any] = {}
         story_items: list[dict[str, Any]] = []
         story_item_total = 0
@@ -5295,7 +6055,8 @@ class OperatorBackend:
             if learning_path.is_file():
                 try:
                     payload = _read_json_object(
-                        _strict_allowlisted_path(root, learning_path, expect="file")
+                        _strict_allowlisted_path(root, learning_path, expect="file"),
+                        capture=capture,
                     )
                     totals = payload.get("totals", {})
                     comms_totals = {
@@ -5328,7 +6089,8 @@ class OperatorBackend:
                     review = _read_json_object(
                         _strict_allowlisted_path(
                             root, review_candidates[-1], expect="file"
-                        )
+                        ),
+                        capture=capture,
                     )
                     recommendation_review = {
                         "automatic_prompt_changes_applied": bool(
@@ -5382,6 +6144,8 @@ class OperatorBackend:
         return {
             "status": status,
             "scope": "current-snapshot",
+            "consistency": "stable-at-capture" if capture else "best-effort",
+            "transactional": False,
             "inventories": categories,
             "outcome_totals": comms_totals,
             "recommendation_review": recommendation_review,
@@ -5414,11 +6178,18 @@ class OperatorBackend:
         }
 
     @staticmethod
-    def _report_assets(run_projections: list[dict[str, Any]]) -> dict[str, Any]:
+    def _report_assets(
+        run_projections: list[dict[str, Any]],
+        *,
+        items_total: int | None = None,
+    ) -> dict[str, Any]:
         reports = []
-        for run in run_projections:
+        for run in reversed(run_projections):
             report = run.get("report", {})
             delivery = run.get("delivery_contract", {})
+            reporting_consistency = _bounded_reporting_consistency(
+                run.get("reporting_consistency")
+            )
             reports.append(
                 {
                     "run_id": run.get("run_id"),
@@ -5441,18 +6212,22 @@ class OperatorBackend:
                         report.get("invite_totals"), _INVITE_TOTAL_FIELDS
                     ),
                     "pending_review_count": report.get("pending_review_count", 0),
+                    "reporting_consistency": reporting_consistency,
                     "evidence": run.get("evidence", {}).get("outreach_report"),
                 }
             )
+        true_total = max(len(reports), items_total or 0)
         return {
             "status": "available" if reports else "unavailable",
             "scope": "run-scoped",
             "count": len(reports),
-            "total": len(reports),
+            "total": true_total,
             "items_returned": len(reports),
-            "truncated": False,
-            "latest_run_id": reports[-1]["run_id"] if reports else None,
-            "failure_count": reports[-1]["failure_count"] if reports else 0,
+            "items_total": true_total,
+            "truncated": true_total > len(reports),
+            "limit": _REPORT_ITEM_LIMIT,
+            "latest_run_id": reports[0]["run_id"] if reports else None,
+            "failure_count": reports[0]["failure_count"] if reports else 0,
             "items": reports,
             "reason": "" if reports else "No report passed the complete run evidence chain.",
         }
@@ -5463,7 +6238,11 @@ class OperatorBackend:
             return {
                 "status": "unavailable",
                 "scope": "run-scoped",
-                "reason": "No source metrics passed the complete run evidence chain.",
+                "reason": (
+                    "No manifest source-family metrics passed the complete run "
+                    "evidence chain."
+                ),
+                "metric_source": "daily_manifest.source_families",
                 "run_id": None,
                 "failure_count": 0,
                 "total": 0,
@@ -5471,6 +6250,17 @@ class OperatorBackend:
                 "latest": None,
             }
         latest = run_projections[-1]
+        latest_evidence = (
+            latest.get("evidence")
+            if isinstance(latest.get("evidence"), dict)
+            else {}
+        )
+        raw_manifest_evidence = latest_evidence.get("daily_manifest")
+        manifest_evidence = (
+            raw_manifest_evidence
+            if isinstance(raw_manifest_evidence, dict)
+            else None
+        )
         sources = []
         for source in latest.get("sources", []):
             if not isinstance(source, dict):
@@ -5478,27 +6268,29 @@ class OperatorBackend:
             status = str(source.get("status") or "not_reported")
             errors = (
                 [f"Exact run manifest reported source status {status}."]
-                if status
-                in {
-                    "failed",
-                    "timed_out",
-                    "failed_missing_artifact",
-                    "not_reported",
-                }
+                if _operator_source_requires_attention(status)
                 else []
             )
             sources.append(
                 {
                     "source": source.get("source"),
                     "status": status,
+                    "reported_status": source.get("reported_status", status),
                     "raw_count": source.get("raw_count", 0),
                     "kept_count": source.get("kept_count", 0),
+                    "scoring_attempted": source.get("scoring_attempted"),
+                    "scoring_errors": source.get("scoring_errors"),
+                    "accepted_for_write": source.get("accepted_for_write"),
                     "errors": errors,
+                    "metric_source": "daily_manifest.source_families",
+                    "evidence": manifest_evidence,
                 }
             )
         return {
             "status": "available",
             "scope": "run-scoped",
+            "metric_source": "daily_manifest.source_families",
+            "evidence": manifest_evidence,
             "run_id": latest.get("run_id"),
             "failure_count": latest.get("failure_count", 0),
             "total": len(sources),
@@ -5508,7 +6300,8 @@ class OperatorBackend:
                 "status": latest.get("status"),
                 "failure_count": latest.get("failure_count", 0),
                 "sources": sources,
-                "evidence": latest.get("evidence", {}).get("source_metrics"),
+                "metric_source": "daily_manifest.source_families",
+                "evidence": manifest_evidence,
             },
         }
 
@@ -5721,14 +6514,27 @@ def _dotenv_value(path: Path, key: str) -> str:
     return ""
 
 
-def _read_bounded_bytes(path: Path, *, limit: int = 20 * 1024 * 1024) -> bytes:
+def _read_bounded_bytes(
+    path: Path,
+    *,
+    limit: int = 20 * 1024 * 1024,
+    capture: MutableSnapshotCapture | None = None,
+) -> bytes:
+    if capture is not None:
+        return capture.read_bytes(path, limit=limit)
     if path.stat().st_size > limit:
         raise ValueError("artifact exceeds the operator limit")
     return path.read_bytes()
 
 
-def _read_json_object(path: Path) -> dict[str, Any]:
-    value = json.loads(_read_bounded_bytes(path).decode("utf-8"))
+def _read_json_object(
+    path: Path,
+    *,
+    capture: MutableSnapshotCapture | None = None,
+) -> dict[str, Any]:
+    value = json.loads(
+        _read_bounded_bytes(path, capture=capture).decode("utf-8")
+    )
     if not isinstance(value, dict):
         raise ValueError("JSON artifact is not an object")
     return value
@@ -5940,12 +6746,21 @@ def _directory_inventory(path: Path, root: Path) -> dict[str, Any]:
     }
 
 
-def _read_xlsx(path: Path, root: Path) -> tuple[dict[str, list[dict[str, str]]], dict[str, Any]]:
+def _read_xlsx(
+    path: Path,
+    root: Path,
+    *,
+    capture: MutableSnapshotCapture | None = None,
+) -> tuple[dict[str, list[dict[str, str]]], dict[str, Any]]:
     resolved_root = root.resolve(strict=True)
     resolved = path.resolve(strict=True)
     if not resolved.is_relative_to(resolved_root) or not resolved.is_file():
         raise ValueError("workbook escapes its configured root")
-    content = resolved.read_bytes()
+    content = (
+        capture.read_bytes(resolved, limit=_MAX_XLSX_BYTES)
+        if capture
+        else resolved.read_bytes()
+    )
     if len(content) > _MAX_XLSX_BYTES:
         raise ValueError("workbook exceeds the operator limit")
     sheets: dict[str, list[dict[str, str]]] = {}
@@ -6130,10 +6945,36 @@ def _account_tracker_projection(
         "Strategic Wishlist",
         "Needs Enrichment",
     )
+    today = datetime.now().astimezone().date()
+    due_counts: Counter[str] = Counter()
+    for row in action_rows:
+        safe_due = _safe_date(row.get("Next Due"))
+        if not safe_due:
+            due_counts["undated"] += 1
+            continue
+        due_date = datetime.strptime(safe_due, "%Y-%m-%d").date()
+        if due_date < today:
+            due_counts["overdue"] += 1
+        elif due_date == today:
+            due_counts["due_today"] += 1
+        else:
+            due_counts["upcoming"] += 1
+    normalized_due_counts = {
+        key: due_counts.get(key, 0)
+        for key in ("overdue", "due_today", "upcoming", "undated")
+    }
     return {
         "evidence": evidence,
         "account_count": len(master),
         "action_count": len(action_rows),
+        "actions_due_now": (
+            normalized_due_counts["overdue"]
+            + normalized_due_counts["due_today"]
+        ),
+        "due_counts": normalized_due_counts,
+        "action_type_counts": _allowlisted_counts(
+            action_rows, "Next Action", _ACCOUNT_ACTIONS
+        ),
         "action_items": action_items,
         "action_items_returned": len(action_items),
         "action_items_total": len(action_rows),
@@ -6182,6 +7023,113 @@ def _allowlisted_numeric_mapping(value: Any, allowed: set[str]) -> dict[str, Any
         if isinstance((number := value.get(key)), (int, float))
         and not isinstance(number, bool)
     }
+
+
+def _bounded_operator_count(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if number < 0:
+        return None
+    return min(number, 1_000_000)
+
+
+def _operator_source_requires_attention(value: Any) -> bool:
+    status = str(value or "").strip().casefold().replace("-", "_")
+    return (
+        status
+        in {
+            "skipped",
+            "partial",
+            "failed",
+            "timed_out",
+            "timeout",
+            "not_reported",
+            "incomplete",
+        }
+        or "failed" in status
+        or "timeout" in status
+    )
+
+
+def _bounded_numeric_mapping(
+    value: Any,
+    *,
+    allowed: set[str] | None = None,
+) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, raw in value.items():
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9 _-]{1,80}", key):
+            continue
+        if allowed is not None and key not in allowed:
+            continue
+        count = _bounded_operator_count(raw)
+        if count is not None:
+            result[key] = count
+    return dict(sorted(result.items()))
+
+
+def _bounded_reporting_consistency(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    categories = _bounded_numeric_mapping(
+        raw.get("categories"),
+        allowed={
+            "missing_source",
+            "duplicate_source",
+            "status",
+            "raw",
+            "kept",
+        },
+    )
+    categories = {
+        key: min(count, 6)
+        for key, count in categories.items()
+        if count
+    }
+    mismatch_count = min(sum(categories.values()), 18)
+    mismatch_source_count = _bounded_operator_count(
+        raw.get("mismatch_source_count")
+    )
+    return {
+        "schema_version": "1.0",
+        "scope": "exact-run-cross-artifact",
+        "status": "mismatch" if mismatch_count else "consistent",
+        "required_source_count": 6,
+        "mismatch_source_count": min(mismatch_source_count or 0, 6),
+        "mismatch_count": mismatch_count,
+        "categories": categories,
+        "compared_fields": ["status", "raw", "kept"],
+    }
+
+
+def _bounded_score_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for name in ("account_score", "fit_score"):
+        summary = value.get(name)
+        if not isinstance(summary, dict):
+            continue
+        projected: dict[str, Any] = {
+            "count": _bounded_operator_count(summary.get("count"))
+        }
+        for field in ("average", "minimum", "maximum"):
+            raw = summary.get(field)
+            projected[field] = (
+                round(float(raw), 3)
+                if isinstance(raw, (int, float))
+                and not isinstance(raw, bool)
+                and float(raw) == float(raw)
+                and abs(float(raw)) <= 1_000_000
+                else None
+            )
+        result[name] = projected
+    return result
 
 
 def _numeric_summary(rows: Iterable[dict[str, str]], field: str) -> dict[str, Any]:

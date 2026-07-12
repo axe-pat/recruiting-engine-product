@@ -30,6 +30,14 @@ done
 
 operator_resolve_config
 
+static_export_root="${OPERATOR_PRODUCT_ROOT}/static-export"
+static_export_state="active"
+if [ -e "${OPERATOR_PRODUCT_ROOT}/static-export.staged" ] \
+  || [ -L "${OPERATOR_PRODUCT_ROOT}/static-export.staged" ]; then
+  static_export_root="${OPERATOR_PRODUCT_ROOT}/static-export.staged"
+  static_export_state="staged"
+fi
+
 failures=0
 
 pass() {
@@ -77,6 +85,15 @@ fi
 
 check_directory "product companion package" "${OPERATOR_PRODUCT_ROOT}/companion/recruiting_companion"
 check_file "companion entrypoint" "${OPERATOR_PRODUCT_ROOT}/companion/recruiting_companion/__main__.py"
+check_file "active-work restart guard" "${OPERATOR_PRODUCT_ROOT}/scripts/check-operator-restart-safety.py"
+check_directory "${static_export_state} generated local UI" "${static_export_root}"
+check_file "generated local UI root" "${static_export_root}/index.html"
+check_file "generated operator route" "${static_export_root}/app/index.html"
+check_directory "generated UI assets" "${static_export_root}/assets"
+check_file "static release compatibility marker" \
+  "${static_export_root}/release-compatibility.json"
+check_file "static integrity marker" \
+  "${static_export_root}/static-integrity.json"
 
 check_directory "ResumeGenerator root" "${RECRUITING_ENGINE_RESUME_ROOT}"
 check_file "nightly scheduler" "${RECRUITING_ENGINE_RESUME_ROOT}/discovery/scripts/nightly_prompt.py"
@@ -103,6 +120,15 @@ check_file "production attestation" "${RECRUITING_ENGINE_ATTESTATION_PATH}"
 check_python "companion Python" "${RECRUITING_ENGINE_COMPANION_PYTHON}"
 check_python "ResumeGenerator Python" "${RECRUITING_ENGINE_RESUME_PYTHON}"
 check_python "Outreach Python" "${RECRUITING_ENGINE_OUTREACH_PYTHON}"
+
+if PYTHONPATH="${OPERATOR_PRODUCT_ROOT}/companion" \
+  "${RECRUITING_ENGINE_COMPANION_PYTHON}" -c \
+  'from pathlib import Path; from recruiting_companion.api import _validated_static_root; _validated_static_root(Path(__import__("sys").argv[1]))' \
+  "${static_export_root}" >/dev/null 2>&1; then
+  pass "${static_export_state} static export is compatible and integrity-verified"
+else
+  fail "static export compatibility or integrity evidence is missing, unsafe, or incompatible"
+fi
 
 if ! operator_is_loopback "${RECRUITING_ENGINE_HOST}"; then
   fail "companion bind is not loopback-only: ${RECRUITING_ENGINE_HOST}"

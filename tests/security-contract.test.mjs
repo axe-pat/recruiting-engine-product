@@ -28,10 +28,29 @@ test("hosted pairing is explicit, short-lived, and tab-scoped", () => {
   assert.match(appFrame, /Connected in this tab/);
 });
 
-test("preview does not probe loopback before user intent", () => {
-  assert.match(appFrame, /if \(!nextConfig\.token\)[\s\S]{0,160}setConnection\("preview"\)/);
+test("hosted preview probes only its own loopback origin before user intent", () => {
+  assert.match(appFrame, /if \(isLoopbackOrigin\(window\.location\.origin\)\)[\s\S]{0,180}localPrimaryBootstrap/);
+  assert.match(appFrame, /if \(!nextConfig\.token\)[\s\S]{0,120}setConnection\("preview"\)/);
+  assert.doesNotMatch(appFrame, /fetch\(["'`]http:\/\/(?:127\.0\.0\.1|localhost)/);
   assert.match(appFrame, /view !== "settings" && connection !== "connected"/);
   assert.match(appFrame, /fictional preview records are no longer rendered on operational routes/);
+});
+
+test("the same-origin local cockpit authenticates without browser-readable tokens", () => {
+  assert.match(appFrame, /localUiServerHeader = "X-Recruiting-Engine-Local-UI-Server"/);
+  assert.match(appFrame, /response\.headers\.get\(localUiServerHeader\) !== "1"/);
+  assert.match(appFrame, /compatibleCompanionVersion = "0\.3\.0"/);
+  assert.match(appFrame, /payload\.compatible_companion_version !== compatibleCompanionVersion/);
+  assert.match(appFrame, /const primaryConfig = \{ baseUrl: window\.location\.origin, token: "" \}/);
+  assert.match(appFrame, /headers: \{ \[localUiHeader\]: "1" \}/);
+  assert.match(appFrame, /credentials: localPrimary \? "same-origin" : "omit"/);
+  assert.match(appFrame, /local_ui_activation_required/);
+  assert.match(appFrame, /scripts\/open-operator-cockpit\.sh/);
+  assert.match(appFrame, /This Mac · always connected/);
+  assert.match(appFrame, /no token session to disconnect/);
+  assert.doesNotMatch(appFrame, /localStorage\.setItem\([^\n]+re_ui_/);
+  assert.doesNotMatch(appFrame, /sessionStorage\.setItem\([^\n]+re_ui_/);
+  assert.doesNotMatch(appFrame, /port === "8765"/);
 });
 
 test("hosted dashboard consumes minimized presentation DTOs", () => {
@@ -49,6 +68,7 @@ test("static document applies a restrictive local-first CSP", () => {
 
 test("operator controls call only the fixed local job registry", () => {
   assert.match(appFrame, /\/api\/v1\/operator\/overview/);
+  assert.match(appFrame, /\/api\/v1\/operator\/progress/);
   assert.match(appFrame, /\/api\/v1\/operator\/jobs/);
   assert.match(appFrame, /JSON\.stringify\(\{ command_id: commandId, confirmation, parameters \}\)/);
   assert.match(operatorWorkspace, /\{ job_id: jobId \}/);
@@ -57,9 +77,45 @@ test("operator controls call only the fixed local job registry", () => {
   assert.doesNotMatch(operatorWorkspace, /exec\(|spawn\(|child_process|command_line|argv/);
 });
 
+test("progress compatibility fallback is limited to unavailable or legacy-scoped routes", () => {
+  assert.match(appFrame, /error\.status === 404/);
+  assert.match(appFrame, /error\.status === 403 && error\.code === "insufficient_scope"/);
+  assert.match(appFrame, /if \(!legacyRouteUnavailable\) throw error/);
+  assert.doesNotMatch(appFrame, /error\.status === 404 \|\| error\.status === 403\s*[);]/);
+});
+
+test("dashboard refreshes cannot overwrite a newer connection generation", () => {
+  assert.match(appFrame, /dashboardLoadRef = useRef<\{ generation: number; controller: AbortController \| null \}>/);
+  assert.match(appFrame, /dashboardLoadRef\.current\.controller\?\.abort\(\)/);
+  assert.match(appFrame, /\{ signal: controller\.signal \}/);
+  assert.match(appFrame, /dashboardLoadRef\.current\.generation === generation/);
+  assert.match(appFrame, /sameCompanionConfig\(nextConfig, activeConfigRef\.current\)/);
+  assert.match(appFrame, /invalidateDashboardLoads\(\)[\s\S]{0,500}sessionStorage\.removeItem\(sessionConfigKey\)/);
+});
+
+test("live polling fails closed with auth-aware state and bounded retries", () => {
+  assert.match(appFrame, /apiError\?\.status === 401/);
+  assert.match(appFrame, /localPrimary \? "activation" : "error"/);
+  assert.match(appFrame, /consecutiveFailures >= 3/);
+  assert.match(appFrame, /Math\.min\(30_000, 4000 \* \(2 \*\* consecutiveFailures\)\)/);
+  assert.match(appFrame, /Last successful live update/);
+  assert.match(appFrame, /markPollingUnavailable/);
+  assert.match(appFrame, /status: "partial"[\s\S]{0,160}is_current: false[\s\S]{0,160}status: "stale"/);
+  assert.match(appFrame, /recent_jobs: \[\]/);
+});
+
+test("live polling performs a full refresh only for meaningful plan changes", () => {
+  assert.match(appFrame, /const enteredAttention =/);
+  assert.match(appFrame, /const scoringErrorsIncreased =/);
+  assert.match(appFrame, /const refreshCurrentPlan = enteredAttention/);
+  assert.match(appFrame, /if \(nextRunActive && refreshCurrentPlan\) \{[\s\S]{0,120}await loadDashboard\(config\)/);
+  assert.match(appFrame, /scoringErrorsIncreased && !scoringIncreaseRefreshed/);
+});
+
 test("the global E2E control opens the reviewed production nightly target", () => {
-  assert.match(appFrame, /window\.location\.assign\("\/app\/runs\?start=nightly"\)/);
+  assert.match(appFrame, /window\.location\.assign\(scheduledRunActive \? "\/app\/runs" : cockpitJobActive \? "\/app\/operations" : "\/app\/runs\?start=nightly"\)/);
   assert.match(appFrame, /"Run E2E"/);
+  assert.match(appFrame, /"View live run"/);
   assert.match(appFrame, /setAutoReviewCommandId\("nightly\.run"\)/);
   assert.match(operatorWorkspace, /candidate\.command_id === autoReviewCommandId/);
   assert.match(operatorWorkspace, /void selectReviewTarget\(target\)/);

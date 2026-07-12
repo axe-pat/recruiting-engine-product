@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 from xml.sax.saxutils import escape, quoteattr
 
-from recruiting_companion.api import make_server
+from recruiting_companion.api import _seal_legacy_static_root, make_server
 from recruiting_companion.auth import TokenStore
 from recruiting_companion.config import Settings
 from recruiting_companion.existing_adapter import ExistingEngineAdapter
@@ -415,6 +415,26 @@ class ServiceTestCase(unittest.TestCase):
 class APITestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
+        static_root = Path(self.temporary.name) / "static-export"
+        (static_root / "app").mkdir(parents=True)
+        (static_root / "assets").mkdir()
+        (static_root / "index.html").write_text("<html>test</html>", encoding="utf-8")
+        (static_root / "app" / "index.html").write_text(
+            "<html>app</html>", encoding="utf-8"
+        )
+        (static_root / "assets" / "app.js").write_text("export {};", encoding="utf-8")
+        (static_root / "release-compatibility.json").write_text(
+            json.dumps(
+                {
+                    "schema": "recruiting_engine.static_compatibility",
+                    "schema_version": 1,
+                    "product_version": "1.3.0",
+                    "compatible_companion_version": "0.3.0",
+                }
+            ),
+            encoding="utf-8",
+        )
+        _seal_legacy_static_root(static_root)
         self.settings = Settings(
             data_dir=Path(self.temporary.name),
             user_id="api-user",
@@ -434,6 +454,7 @@ class APITestCase(unittest.TestCase):
             self.tokens,
             host="127.0.0.1",
             port=0,
+            static_root=static_root,
         )
         self.port = self.server.server_port
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -515,6 +536,49 @@ class APITestCase(unittest.TestCase):
             "https://axe-pat.github.io",
         )
         viewer.assert_called_once_with(run_id)
+
+    def test_authenticated_operator_progress_is_lightweight_and_no_store(self) -> None:
+        path = "/api/v1/operator/progress"
+        status, unauthorized, _ = self.request("GET", path)
+        self.assertEqual(status, 401)
+        self.assertEqual(unauthorized["error"]["code"], "unauthorized")
+
+        status, paired, _ = self.request(
+            "POST",
+            "/api/v1/pair",
+            body={
+                "pairing_token": self.bootstrap.pairing_token,
+                "client_type": "web",
+            },
+        )
+        self.assertEqual(status, 200)
+        web_bearer = str(paired["bearer_token"])
+        expected = {
+            "schema_version": "1.0",
+            "generated_at": "2026-07-13T02:10:00+00:00",
+            "current_run_progress": {
+                "status": "running",
+                "run_id": "20260713-010001",
+            },
+            "recent_jobs": [{"id": "opjob_123", "status": "running"}],
+        }
+        with patch.object(
+            OperatorBackend,
+            "progress",
+            return_value=expected,
+        ) as progress:
+            status, payload, headers = self.request(
+                "GET",
+                path,
+                bearer=web_bearer,
+                origin="https://axe-pat.github.io",
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, expected)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        progress.assert_called_once_with()
 
     def test_pair_auth_rotation_cors_and_host_protection(self) -> None:
         status, health, headers = self.request(
@@ -760,6 +824,7 @@ class APITestCase(unittest.TestCase):
             ("GET", "/api/v1/existing-engine/status", None),
             ("GET", "/api/v1/existing-engine/snapshot", None),
             ("GET", "/api/v1/operator/overview", None),
+            ("GET", "/api/v1/operator/progress", None),
             ("GET", "/api/v1/operator/capabilities", None),
             ("GET", "/api/v1/operator/assets", None),
             ("GET", "/api/v1/operator/review-targets", None),
@@ -1370,6 +1435,21 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
                 self.assertEqual(
                     shared_commands["application.resume.generate"]["status"],
                     "unavailable",
+                )
+                jobs_before_maintenance = len(backend.list_jobs())
+                with self.assertRaisesRegex(
+                    ConflictError,
+                    "temporarily paused",
+                ):
+                    backend.submit_job(
+                        command_id="production.preflight",
+                        confirmation="RUN_PRODUCTION_PREFLIGHT",
+                        requested_scope="local",
+                    )
+                self.assertEqual(
+                    len(backend.list_jobs()),
+                    jobs_before_maintenance,
+                    "exclusive maintenance must reject before job insertion",
                 )
                 fcntl.flock(shared_lock.fileno(), fcntl.LOCK_UN)
 
@@ -2903,17 +2983,31 @@ class ExistingAdapterTestCase(unittest.TestCase):
             self.assertEqual(empty["verified_run_count"], 0)
 
             run_id = "20260711-120000"
+            action_path = validation / f"{run_id}-action-queue.json"
             artifacts = {
-                validation / f"{run_id}-source-metrics.json": {"sources": []},
-                validation / f"{run_id}-action-queue.json": {
+                validation / f"{run_id}-source-metrics.json": {
+                    "run_id": run_id,
+                    "run_started_at": "2026-07-11T12:00:00Z",
+                    "sources": [],
+                    "action_queue": {"artifact": str(action_path)},
+                },
+                action_path: {
                     "counts": {
                         "scored_application_selected": 99,
+                        "application_plus_outreach": 0,
                         "application_only": 2,
+                        "outreach_only_today": 0,
+                        "relationship_buffer": 0,
                         "follow_up": 3,
+                        "skipped_internal": 0,
                     },
                     "source_counts": {"application_only": {"import": 2}},
-                    "application_only": [],
-                    "follow_up": [],
+                    "application_plus_outreach": [],
+                    "application_only": [{}, {}],
+                    "outreach_only_today": [],
+                    "relationship_buffer": [],
+                    "follow_up": [{}, {}, {}],
+                    "skipped_internal": [],
                 },
             }
             for path, value in artifacts.items():
@@ -3050,6 +3144,41 @@ class ExistingAdapterTestCase(unittest.TestCase):
             self.assertEqual(status["latest_verified_run"]["run_id"], run_id)
             self.assertEqual(status["latest_verified_run"]["status"], "attention")
             self.assertFalse(status["live_run"]["supported"])
+
+            valid_action_queue = artifacts[action_path]
+            invalid_queues = {
+                "lane_shape": {
+                    **valid_action_queue,
+                    "application_only": [{}, "not-an-object"],
+                },
+                "reported_count": {
+                    **valid_action_queue,
+                    "counts": {
+                        **valid_action_queue["counts"],
+                        "follow_up": 4,
+                    },
+                },
+            }
+            expected_errors = {
+                "lane_shape": "must be a list of objects",
+                "reported_count": "count does not match its entries",
+            }
+            for case, invalid_queue in invalid_queues.items():
+                with self.subTest(action_queue_validation=case):
+                    action_path.write_text(
+                        json.dumps(invalid_queue), encoding="utf-8"
+                    )
+                    rejected = ExistingEngineAdapter(settings).status()
+                    self.assertEqual(rejected["verified_run_count"], 0)
+                    self.assertTrue(
+                        any(
+                            expected_errors[case] in reason
+                            for reason in rejected["rejections"]
+                        )
+                    )
+            action_path.write_text(
+                json.dumps(valid_action_queue), encoding="utf-8"
+            )
 
             queue_root = (
                 resume / "apps" / "Apply queues" / "current_apply_queue"
@@ -3252,7 +3381,8 @@ class ExistingAdapterTestCase(unittest.TestCase):
             queue = snapshot["run_snapshot"]["queue"]
             self.assertEqual(queue["decision_total"], 5)
             self.assertEqual(
-                queue["decision_total_name"], "mutually_exclusive_decision_lanes"
+                queue["decision_total_name"],
+                "validated_action_queue_lane_entries",
             )
             self.assertEqual(
                 queue["decision_total_parts"],

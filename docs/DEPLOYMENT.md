@@ -40,8 +40,15 @@ npm run export:static
 ```
 
 `scripts/export-static.mjs` renders the product, story, architecture, privacy,
-and every `/app/*` surface from the same validated server build. It copies the
-exact client assets and social image, adds `.nojekyll`, and writes a root fallback.
+and every `/app/*` surface from the same server build. It copies the exact client
+assets and social image, adds `.nojekyll`, writes a root fallback, emits the
+release compatibility marker, hashes the complete tree into
+`static-integrity.json`, and validates it with the companion. The completed tree
+is atomically published as `static-export.staged/`; the exporter never rewrites
+the live directory a local companion may be serving. Publish that exact staged
+directory to the deployment repository before a local install consumes it, or
+publish the promoted `static-export/` afterward. Never publish the private
+`.static-export.staging-*` or rollback directories.
 The deployment repository serves the generated output from `main` at the user
 Pages origin.
 
@@ -51,10 +58,12 @@ the public artifact can be traced back to its tested source.
 ## Data boundary
 
 Deployment never reads the operating repositories or their workspaces. The
-public bundle contains only reviewed aggregates and fictional demo rows. After
+public bundle contains only reviewed product-story material and an empty,
+connection-gated operational shell—never local operator records. After hosted
 pairing, client-side requests go directly to a loopback companion; GitHub Pages
-does not proxy or store that traffic. The safe refresh process is documented in
-`product-notes/data-portability.md`.
+does not proxy or store that traffic. The primary same-origin local surface and
+safe refresh process are documented in
+[`PRIMARY_LOCAL_UI.md`](PRIMARY_LOCAL_UI.md).
 
 ## Companion and extension release
 

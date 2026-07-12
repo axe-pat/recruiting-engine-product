@@ -229,6 +229,13 @@ The adapter must test non-blocking ownership.
 - `running`: emitted only by live lock/process status, never inferred from a
   stale summary.
 
+Normalized status also consumes the exact report's `run_status`,
+`track_2_failed`, and nested Track 2 execution status. A zero-returning wrapper
+cannot turn `partial_failed` into `complete`. For operator-started production
+runs, completion additionally requires exactly one newly verified run and a
+`full_delivery` contract derived from the exact summary plus the manifest-bound
+Track 2 run artifact.
+
 ## Dashboard projection
 
 The run report is the preferred source for run-scoped dashboard aggregates. Its
@@ -241,6 +248,11 @@ projection may include:
 - invite and follow-up totals;
 - review and open-action counts;
 - company discovery, role-surface, cadence, and outcome summaries.
+
+Each report row also carries the exact run's delivery mode. The UI does not read
+`daily_run_report.html` or any mutable convenience alias; a manually started
+daytime run remains a separate run-ID row rather than replacing or masquerading
+as scheduled production evidence.
 
 The action queue supplies run-scoped lanes such as selected applications,
 apply-plus-outreach, application-only, relationship work, follow-up, review, and

@@ -57,7 +57,7 @@ test("operator controls call only the fixed local job registry", () => {
   assert.doesNotMatch(operatorWorkspace, /exec\(|spawn\(|child_process|command_line|argv/);
 });
 
-test("the global E2E control opens the reviewed no-delivery nightly target", () => {
+test("the global E2E control opens the reviewed production nightly target", () => {
   assert.match(appFrame, /window\.location\.assign\("\/app\/runs\?start=nightly"\)/);
   assert.match(appFrame, /"Run E2E"/);
   assert.match(appFrame, /setAutoReviewCommandId\("nightly\.run"\)/);

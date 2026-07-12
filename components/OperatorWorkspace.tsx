@@ -121,7 +121,7 @@ const commandCopy: Record<string, [string, string]> = {
   "open.latest_report": ["Open latest exact report", "Open the newest fully verified run-scoped report."],
   "open.story_workbench": ["Open story workbench", "Open the private story and interview workspace locally."],
   "open.communication_review": ["Open communication review", "Open the current local draft-review artifact."],
-  "nightly.run": ["Run reviewed nightly pipeline", "Run the fixed prepare/generate nightly after exact review; every delivery flag stays omitted."],
+  "nightly.run": ["Run production nightly pipeline", "Run the fixed off-cycle production pipeline after exact review, with bounded app-queue and Track 2 LinkedIn delivery enabled."],
   "outreach.send": ["Send outreach", "Disabled in the generic cockpit command surface."],
   "application.assist.fill_to_review": ["Application fill safety gate", "Blocked until the browser runner can technically intercept final Submit; prompt-only stopping is insufficient."],
 };
@@ -792,7 +792,9 @@ function ReportRows({ items, onOpen, loadingRunId }: { items: UnknownRecord[]; o
   return <div className="operator-row-list">{items.map((item, index) => {
     const workspace = asRecord(item.workspace_counts);
     const workspaceDetail = Object.entries(workspace).slice(0, 3).map(([label, value]) => `${label.replaceAll("_", " ")} ${number(value)}`).join(" · ");
-    const detail = [`${number(item.source_count)} sources`, `${number(item.failure_count)} failures`, `${number(item.pending_review_count)} pending review`, workspaceDetail].filter(Boolean).join(" · ");
+    const deliveryMode = text(item.delivery_mode, "not reported").replaceAll("_", " ");
+    const reportHealth = text(item.run_status, "not reported").replaceAll("_", " ");
+    const detail = [deliveryMode, `report ${reportHealth}`, `${number(item.source_count)} sources`, `${number(item.failure_count)} summary failures`, `${number(item.pending_review_count)} pending review`, workspaceDetail].filter(Boolean).join(" · ");
     const runId = text(item.run_id, "");
     return <article key={runId || `${index}`}><span>{text(item.status, "verified")}</span><div><strong>{runId || "Run ID unavailable"}</strong><p>{detail}</p></div><div className="operator-report-row-actions"><small>{text(item.completed_at ?? item.started_at, "—")}</small><button type="button" disabled={!runId || Boolean(loadingRunId)} onClick={() => void onOpen(runId)}>{loadingRunId === runId ? "Loading…" : "View full report"}</button></div></article>;
   })}</div>;
@@ -876,7 +878,7 @@ function OperationsSurface({ overview, commands, onSelect }: { overview: Operato
   return (
     <>
       <section className="operator-split"><div className="operator-panel"><div className="operator-panel-head"><div><span>Capability registry</span><h3>Fixed local actions</h3></div></div><CommandButtons commands={commands} onSelect={onSelect} full /></div><aside className="operator-panel operator-locks"><span className="operator-kicker">Concurrency guard</span><h3>Production locks</h3>{Object.keys(locks).length ? Object.entries(locks).map(([name, state]) => <div key={name}><span><i className={`lock-${state}`} />{name.replaceAll("_", " ")}</span><strong>{state}</strong></div>) : <p>No lock registry is configured.</p>}</aside></section>
-      <section className="operator-panel"><div className="operator-panel-head"><div><span>Audit trail</span><h3>Recent cockpit jobs</h3></div></div>{jobs.length ? <div className="operator-job-list">{jobs.map((job) => <article key={job.id}><span>{job.status ?? "unknown"}</span><div><strong>{job.label || job.command_id || job.id}</strong><p>{job.summary || job.error || "No summary recorded."}</p></div><small>{job.completed_at || job.started_at || job.created_at || "—"}</small></article>)}</div> : <p className="operator-empty-row">No cockpit action has run yet.</p>}</section>
+      <section className="operator-panel"><div className="operator-panel-head"><div><span>Audit trail</span><h3>Recent cockpit jobs</h3></div></div>{jobs.length ? <div className="operator-job-list">{jobs.map((job) => <article key={job.id}><span>{job.status ?? "unknown"}</span><div><strong>{job.label || job.command_id || job.id}</strong><p>{job.summary || job.error || "No summary recorded."}{job.result_run_id ? ` Run ${job.result_run_id} · ${job.result_health || "health unavailable"} · ${(job.result_delivery_mode || "delivery not reported").replaceAll("_", " ")}.` : ""}</p></div><small>{job.completed_at || job.started_at || job.created_at || "—"}</small></article>)}</div> : <p className="operator-empty-row">No cockpit action has run yet.</p>}</section>
       <p className="operator-boundary-note">Consequential capabilities have visible review lanes but stay non-executable until their installed fixed-argument, reservation, archive, and reconciliation contracts are proven. Arbitrary shell access remains impossible.</p>
     </>
   );

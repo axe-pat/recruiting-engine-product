@@ -481,6 +481,11 @@ export function AppFrame({ view }: { view: AppView }) {
   useEffect(() => {
     const active = operatorOverview?.recent_jobs?.some((job) => job.status === "queued" || job.status === "running");
     if (!active || connection !== "connected" || workspaceMode !== "existing") return;
+    const activeJobIds = new Set(
+      (operatorOverview?.recent_jobs ?? [])
+        .filter((job) => job.status === "queued" || job.status === "running")
+        .map((job) => job.id),
+    );
     let cancelled = false;
     const poll = async () => {
       try {
@@ -488,7 +493,14 @@ export function AppFrame({ view }: { view: AppView }) {
         if (cancelled) return;
         const jobs = payload.items ?? [];
         setOperatorOverview((current) => current ? { ...current, recent_jobs: jobs } : current);
-        if (!jobs.some((job) => job.status === "queued" || job.status === "running")) await loadDashboard(config);
+        if (!jobs.some((job) => job.status === "queued" || job.status === "running")) {
+          const finished = jobs.find((job) => activeJobIds.has(job.id) && job.status !== "queued" && job.status !== "running");
+          await loadDashboard(config);
+          if (finished && !cancelled) {
+            const runSuffix = finished.result_run_id ? ` Run ${finished.result_run_id}.` : "";
+            setNotice(`${finished.label || "Operator action"}: ${finished.summary || finished.status || "finished"}${runSuffix}`);
+          }
+        }
       } catch {
         // The next explicit refresh will recover a transient local polling error.
       }

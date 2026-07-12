@@ -194,6 +194,10 @@ CREATE TABLE IF NOT EXISTS operator_jobs (
     preflight_stdout_sha256 TEXT NOT NULL DEFAULT '',
     preflight_stderr_sha256 TEXT NOT NULL DEFAULT '',
     result_code TEXT NOT NULL DEFAULT '',
+    result_run_id TEXT NOT NULL DEFAULT '',
+    result_health TEXT NOT NULL DEFAULT '',
+    result_report_sha256 TEXT NOT NULL DEFAULT '',
+    result_delivery_mode TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_operator_jobs_user
@@ -279,6 +283,10 @@ class Database:
                 ("preflight_returncode", "INTEGER"),
                 ("preflight_stdout_sha256", "TEXT NOT NULL DEFAULT ''"),
                 ("preflight_stderr_sha256", "TEXT NOT NULL DEFAULT ''"),
+                ("result_run_id", "TEXT NOT NULL DEFAULT ''"),
+                ("result_health", "TEXT NOT NULL DEFAULT ''"),
+                ("result_report_sha256", "TEXT NOT NULL DEFAULT ''"),
+                ("result_delivery_mode", "TEXT NOT NULL DEFAULT ''"),
             ):
                 if column not in operator_columns:
                     connection.execute(

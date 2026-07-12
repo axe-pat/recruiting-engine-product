@@ -3,9 +3,12 @@
 This setup runs the local companion as a per-user macOS LaunchAgent in
 `existing` mode. It reads verified ResumeGenerator and Outreach evidence, binds
 only to loopback, and enables only fixed, hash-bound reviewed actions. Generic
-live-run mode remains disabled. A reviewed safe-nightly action invokes the same
-attested scheduler wrapper with a fully fingerprinted prepare/generate argument
-set and all direct delivery flags omitted.
+live-run mode remains disabled. A reviewed production-nightly action invokes the
+same attested scheduler wrapper with a fully fingerprinted off-cycle argument
+set loaded from ResumeGenerator's canonical `nightly_contract.py print` surface.
+Its reviewed artifact binds the contract script and exact returned argv, including
+bounded app-queue delivery and Track 2 LinkedIn delivery; it is not a
+preparation-only run.
 
 ## Defaults
 

@@ -57,7 +57,7 @@ operational records go directly to the companion running on that device.
 - `/app/accounts` — real account portfolio, action queue, tiers, and stages;
 - `/app/stories` — private story, positioning, and communication inventories;
 - `/app/operations` — fixed local capabilities, production guards, and job history;
-- `/app/runs` and `/app/reports` — reviewed no-delivery E2E execution, run-scoped evidence, and sandboxed full exact reports;
+- `/app/runs` and `/app/reports` — reviewed production E2E execution, run-scoped evidence, and sandboxed full exact reports;
 - `/app/applications` and `/app/outreach` — execution state and full-draft approval;
 - `/app/settings` — pairing, portable/existing mode, and engine-binding status;
 - `/story`, `/architecture`, and `/privacy` — product narrative, system design, and data policy.
@@ -112,11 +112,16 @@ The adapter follows exact run pointers and refuses mutable `latest`/`current`
 aliases. Bounded local projections, a durable exact-target review ledger, and
 fixed confirmed actions are available. Applied/closed lifecycle transitions use
 the artifact-preserving upstream contract. Recipient-bound delivery and the
-no-delivery safe nightly execute only after one exact target is reviewed and
-approved and their installed readiness checks pass. The browser-fill lane stays
+bounded production nightly execute only after one exact target is reviewed and
+approved and their installed readiness checks pass. The production target
+enables the off-cycle app-queue and Track 2 LinkedIn delivery contracts; email
+delivery remains separately recipient-reviewed. The browser-fill lane stays
 blocked because the installed runner cannot technically intercept final Submit;
 a prompt-only stop rule is not treated as a safety boundary. LinkedIn and SMTP
-completion require exact outcome artifacts. Arbitrary commands never exist. See the
+completion require exact outcome artifacts. An operator run is complete only
+after one newly created summary, manifest, and report chain verifies as healthy;
+exit code zero alone is not success. The run surfaces label each exact delivery
+contract and never read a mutable `latest` report alias. Arbitrary commands never exist. See the
 [operator cockpit contract](docs/OPERATOR_COCKPIT.md),
 [the adapter contract](docs/EXISTING_ENGINE_ADAPTER.md) and
 [run-evidence contract](docs/RUN_EVIDENCE_CONTRACT.md).

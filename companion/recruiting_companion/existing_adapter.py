@@ -106,7 +106,7 @@ class ExistingEngineAdapter:
                 "supported": False,
                 "reason": (
                     "Generic live-run mode is disabled. The separate operator "
-                    "review ledger may expose one fixed safe-nightly action."
+                    "review ledger may expose one fixed production-nightly action."
                 ),
             },
             "busy": False,
@@ -279,6 +279,9 @@ class ExistingEngineAdapter:
                 "returncode": _safe_int_or_none(value.get("returncode")),
             }
         queue_counts = _numeric_tree(action_queue.get("counts", {}))
+        track_2_execution = report.get("track_2_execution")
+        if not isinstance(track_2_execution, dict):
+            track_2_execution = {}
         decision_parts = {
             lane: _decision_count(queue_counts.get(lane)) for lane in _DECISION_LANES
         }
@@ -289,6 +292,7 @@ class ExistingEngineAdapter:
             "started_at": run["started_at"],
             "completed_at": run["completed_at"],
             "failure_count": _safe_int(run.get("failure_count")),
+            "delivery_contract": run.get("delivery_contract", {}),
             "daily_engine": {
                 "status": manifest.get("status"),
                 "returncode": manifest.get("returncode"),
@@ -302,6 +306,10 @@ class ExistingEngineAdapter:
             },
             "report": {
                 "status": "valid",
+                "run_status": str(report.get("run_status") or "not_reported"),
+                "track_2_status": str(
+                    track_2_execution.get("status") or "not_reported"
+                ),
                 "sources": report_sources,
                 "stage_metrics": stage_metrics,
                 "workspace_counts": _numeric_tree(report.get("workspace_counts", {})),
@@ -585,10 +593,30 @@ class ExistingEngineAdapter:
             for value in manifest["source_families"].values()
             if isinstance(value, dict)
         }
+        report_run_status = str(report.get("run_status") or "not_reported")
+        track_2_execution = report.get("track_2_execution")
+        track_2_status = (
+            str(track_2_execution.get("status") or "not_reported")
+            if isinstance(track_2_execution, dict)
+            else "not_reported"
+        )
+        report_requires_attention = (
+            report_run_status != "completed"
+            or bool(report.get("track_2_failed", False))
+            or track_2_status
+            in {
+                "failed",
+                "partial_failed",
+                "timed_out",
+                "cancelled",
+                "not_reported",
+            }
+        )
         normalized_status = (
             "attention"
             if failures
             or summary["status"] == "failed"
+            or report_requires_attention
             or source_states.intersection({"skipped", "failed", "timed_out", "not_reported"})
             or any(state.startswith("failed") for state in source_states)
             else "complete"
@@ -605,6 +633,7 @@ class ExistingEngineAdapter:
             "completed_at": completed_at.isoformat(),
             "_created_at_epoch": created_at.timestamp(),
             "failure_count": len(failures),
+            "delivery_contract": self._delivery_contract(summary, manifest),
             "source_status_counts": dict(
                 _count_values(
                     str(value.get("status"))
@@ -620,6 +649,58 @@ class ExistingEngineAdapter:
                 "outreach_report": report_evidence,
                 "outreach_html": html_evidence,
             },
+        }
+
+    def _delivery_contract(
+        self,
+        summary: dict[str, Any],
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Classify requested delivery only from artifacts bound to this run."""
+        assert self.settings.outreach_root is not None
+        app_target = summary.get("app_queue_target_sends")
+        app_requested: bool | None = None
+        if isinstance(app_target, (str, int)) and not isinstance(app_target, bool):
+            app_requested = str(app_target).strip().casefold() not in {
+                "",
+                "0",
+                "false",
+                "none",
+            }
+
+        track_2_requested: bool | None = None
+        track_2_evidence: dict[str, Any] | None = None
+        track_2 = manifest.get("track_2")
+        pointer = track_2.get("run_artifact") if isinstance(track_2, dict) else None
+        if isinstance(pointer, str) and pointer.strip():
+            try:
+                path = self._resolve_pointer(
+                    self.settings.outreach_root,
+                    pointer,
+                    "track_2.run_artifact",
+                )
+                payload, track_2_evidence = self._read_object_with_evidence(
+                    path, self.settings.outreach_root
+                )
+                if isinstance(payload.get("send_linkedin"), bool):
+                    track_2_requested = payload["send_linkedin"]
+            except (OSError, ValueError, json.JSONDecodeError):
+                track_2_evidence = None
+
+        if app_requested is True and track_2_requested is True:
+            mode = "full_delivery"
+        elif app_requested is False and track_2_requested is False:
+            mode = "preparation_only"
+        elif app_requested is None and track_2_requested is None:
+            mode = "not_reported"
+        else:
+            mode = "mixed"
+        return {
+            "mode": mode,
+            "app_queue_delivery_requested": app_requested,
+            "track_2_linkedin_delivery_requested": track_2_requested,
+            "email_delivery": "recipient_review_only",
+            "track_2_evidence": track_2_evidence,
         }
 
     @staticmethod

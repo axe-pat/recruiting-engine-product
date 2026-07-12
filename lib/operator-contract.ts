@@ -40,6 +40,10 @@ export type OperatorJob = {
   summary?: string;
   error?: string;
   result_code?: string;
+  result_run_id?: string;
+  result_health?: string;
+  result_report_sha256?: string;
+  result_delivery_mode?: string;
 };
 
 export type OperatorReviewTarget = {

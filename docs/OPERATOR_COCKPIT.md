@@ -85,22 +85,39 @@ and the approval remains unconsumed. The database also enforces one active
 pending/reviewed/approved row per exact target, so concurrent staging requests
 cannot mint parallel approvals.
 
-The safe-nightly target fingerprints the complete server-owned pipeline argument
-vector, the wrapper argument vector, `nightly_prompt.py`,
-`run_nightly_pipeline.py`, and the production attestation. Its fixed pipeline
-configuration keeps discovery, generation, outreach preparation, and the Track 2
-planning pass, sets the legacy send target to zero, and omits
-`--execute-sends`, `--track-2-send-linkedin`, and
-`--execute-linkedin-followups`. Immediately before consumption, the companion
-runs the fixed `--production-check-only` preflight. A dirty or mismatched release
+The production-nightly target runs the fixed
+`nightly_contract.py print` command and fingerprints that contract script, its
+exact stdout, parsed argv, the wrapper argument vector, `nightly_prompt.py`,
+`run_nightly_pipeline.py`, and the production attestation. The companion keeps no
+second full argument tuple. Execution reuses the exact reviewed canonical output,
+which includes `--execute-sends`, `--target-sends auto`, and
+`--track-2-send-linkedin`; any contract-script or output change invalidates the
+approval. The deprecated direct follow-up flag remains omitted because Track 2
+owns LinkedIn replies and follow-ups. Immediately before consumption, the companion
+runs the fixed `--production-check-only` preflight. The wrapper also receives
+`--require-live-delivery-contract`, so it independently rejects any argument
+vector that drifts from the canonical production contract before scheduler state
+or live work begins. A dirty or mismatched release
 leaves approval unconsumed. After a successful preflight, approval is consumed,
 the companion mutation lock is released, and only then is `nightly_prompt.py`
 spawned so its scheduler/pipeline lock order cannot deadlock.
 
 The top-bar **Run E2E** control opens this exact nightly target directly; it does
 not bypass the review ledger. The user still stages the target, records review,
-approves it, and enters `RUN_REVIEWED_NIGHTLY` before the fixed no-delivery
+approves it, and enters `RUN_REVIEWED_NIGHTLY` before the fixed production
 process can start. **Refresh** remains a separate read-only control.
+
+After the process exits, the companion requires exactly one newly created run to
+pass the summary, manifest, source-metrics, action-queue, and Outreach report
+chain. It stores that run ID, report hash, normalized health, and delivery mode
+on the operator job. Exit code zero is reported as failed when the exact report
+is partial, failed, missing, ambiguous, or does not prove `full_delivery`.
+The UI completion notice uses this authoritative job result.
+
+Runs and Reports always fetch the immutable run-ID HTML artifact and show the
+delivery mode recorded by that run. They never consume the mutable convenience
+alias, so a daytime operator run remains a distinct run rather than masquerading
+as the scheduled nightly.
 
 The general operator overview never contains raw profile URLs, email addresses,
 recipient names, subjects, message bodies, or thread context. Those fields are
@@ -115,6 +132,9 @@ and note. Follow-ups bind contact, thread, draft kind, latest inbound context, a
 exact draft. Email binds organization/contact, exact address, subject, and body.
 Loose `latest` files, modification-time discovery, send-result artifacts, paths
 outside the installed Outreach root, and symlinks are rejected.
+The persistent workspace `linkedin_followup_pending_review.json` snapshot is not
+an operator review source; live reconciliation must produce a new manifest-bound
+draft artifact before a row can appear in this surface.
 
 LinkedIn approval materialization invokes only the installed
 `outreach.reviewed_linkedin` preview and approve contracts, then executes the

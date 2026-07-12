@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import threading
@@ -127,47 +128,16 @@ _APPLY_ASSIST_BLOCKED_REASON = (
     "tool-enforced final-submit interceptor; a prompt-only stop rule is not an "
     "acceptable human-submit boundary."
 )
-_SAFE_NIGHTLY_PIPELINE_ARGS = (
-    "--cycle-config",
-    "offcycle_light",
+_REQUIRED_PRODUCTION_NIGHTLY_FLAGS = {
     "--generate",
     "--prepare-outreach",
-    "--target-sends",
-    "0",
-    "--per-company-send-limit",
-    "5",
-    "--send-min-score",
-    "20",
-    "--linkedin-discovery-timeout",
-    "1800",
-    "--outreach-resolve-limit",
-    "20",
-    "--outreach-enrich-limit",
-    "20",
-    "--outreach-campaign-limit",
-    "30",
-    "--outreach-timeout-seconds",
-    "4",
-    "--outreach-max-search-results",
-    "3",
+    "--execute-sends",
     "--execute-track-2-daily-plan",
-    "--track-2-total-actions",
-    "auto",
-    "--track-2-companies",
-    "auto",
-    "--track-2-linkedin-invites",
-    "auto",
-    "--track-2-linkedin-followups",
-    "auto",
-    "--track-2-company-mapping",
-    "auto",
-    "--track-2-email-research",
-    "auto",
-    "--track-2-context-enrichment",
-    "8",
-    "--track-2-email-drafts",
-    "auto",
-)
+    "--track-2-send-linkedin",
+}
+_FORBIDDEN_PRODUCTION_NIGHTLY_FLAGS = {"--execute-linkedin-followups"}
+_MAX_NIGHTLY_CONTRACT_OUTPUT_BYTES = 16 * 1024
+_MAX_NIGHTLY_CONTRACT_TOKENS = 128
 _REVIEW_GATED_COMMANDS = {
     "nightly.run",
     "outreach.linkedin.send",
@@ -267,7 +237,8 @@ _COMMAND_CATALOG = {
         "confirmation": "RUN_REVIEWED_NIGHTLY",
         "policy": "contract_required",
         "reason": (
-            "Requires one current release review and the reviewed-actions runtime gate."
+            "Requires one current release review and the reviewed-actions runtime gate. "
+            "This is the bounded production-delivery contract."
         ),
     },
     "outreach.send": {
@@ -526,7 +497,8 @@ _COMMAND_PRESENTATION = {
     "nightly.run": {
         "label": "Run full nightly",
         "description": (
-            "Run one reviewed prepare/generate cycle with all direct delivery flags omitted."
+            "Run one reviewed production cycle with bounded app-queue and Track 2 "
+            "LinkedIn delivery enabled."
         ),
         "category": "production",
         "risk": "external",
@@ -1382,7 +1354,9 @@ class OperatorBackend:
 
     def _review_target_records(
         self,
+        command_ids: set[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+        requested = command_ids or set(_REVIEW_GATED_COMMANDS)
         records: list[dict[str, Any]] = []
         reasons: dict[str, list[str]] = {
             command_id: [] for command_id in _REVIEW_GATED_COMMANDS
@@ -1399,65 +1373,78 @@ class OperatorBackend:
                 command_id: [message] for command_id in _REVIEW_GATED_COMMANDS
             }
 
-        try:
-            records.append(self._nightly_review_target())
-        except (OSError, ValueError, ValidationError):
-            reasons["nightly.run"].append(
-                "production release attestation or safe nightly surface is unavailable"
-            )
+        if "nightly.run" in requested:
+            try:
+                records.append(self._nightly_review_target())
+            except (OSError, ValueError, ValidationError):
+                reasons["nightly.run"].append(
+                    "production release attestation or production nightly surface is unavailable"
+                )
 
-        try:
-            queue_root, rows = self._current_queue_rows()
-            for row in rows[:_REVIEW_TARGET_LIMIT]:
-                job_id = _numeric_job_id(row)
-                if job_id is None:
-                    continue
-                folder = self._queue_job_folder(row, queue_root=queue_root)
-                artifact_sha = _application_artifact_fingerprint(
-                    row, folder, maximum_bytes=64 * 1024 * 1024
-                )
-                company = _safe_display_text(row.get("company"), maximum=80)
-                role = _safe_display_text(
-                    row.get("role_title") or row.get("role"), maximum=100
-                )
-                label = f"#{job_id} · {company or 'Company'} · {role or 'Role'}"
-                common_snapshot = {
-                    "job_id": job_id,
-                    "artifact_sha256": artifact_sha,
-                    "maximum_items": 1,
-                }
-                for command_id, terminal_status in (
-                    ("application.status.applied", "applied"),
-                    ("application.status.closed", "closed"),
-                ):
-                    records.append(
-                        self._make_review_target(
-                            command_id=command_id,
-                            target_type="application_status_archive",
-                            label=label,
-                            detail=(
-                                f"One job to {terminal_status} through the archive-first, artifact-preserving transition."
-                            ),
-                            artifact_sha256=artifact_sha,
-                            snapshot={
-                                **common_snapshot,
-                                "terminal_status": terminal_status,
-                            },
-                        )
-                    )
-        except (OSError, ValueError, ValidationError, json.JSONDecodeError):
-            for command_id in (
+        application_commands = requested.intersection(
+            {
                 "application.assist.fill_to_review",
                 "application.status.applied",
                 "application.status.closed",
-            ):
-                reasons[command_id].append(
-                    "current apply queue targets are unavailable or unsafe"
-                )
-        outreach_records, outreach_reasons = self._outreach_review_target_records()
-        records.extend(outreach_records)
-        for command_id, values in outreach_reasons.items():
-            reasons[command_id].extend(values)
+            }
+        )
+        if application_commands:
+            try:
+                queue_root, rows = self._current_queue_rows()
+                for row in rows[:_REVIEW_TARGET_LIMIT]:
+                    job_id = _numeric_job_id(row)
+                    if job_id is None:
+                        continue
+                    folder = self._queue_job_folder(row, queue_root=queue_root)
+                    artifact_sha = _application_artifact_fingerprint(
+                        row, folder, maximum_bytes=64 * 1024 * 1024
+                    )
+                    company = _safe_display_text(row.get("company"), maximum=80)
+                    role = _safe_display_text(
+                        row.get("role_title") or row.get("role"), maximum=100
+                    )
+                    label = f"#{job_id} · {company or 'Company'} · {role or 'Role'}"
+                    common_snapshot = {
+                        "job_id": job_id,
+                        "artifact_sha256": artifact_sha,
+                        "maximum_items": 1,
+                    }
+                    for command_id, terminal_status in (
+                        ("application.status.applied", "applied"),
+                        ("application.status.closed", "closed"),
+                    ):
+                        if command_id not in requested:
+                            continue
+                        records.append(
+                            self._make_review_target(
+                                command_id=command_id,
+                                target_type="application_status_archive",
+                                label=label,
+                                detail=(
+                                    f"One job to {terminal_status} through the archive-first, artifact-preserving transition."
+                                ),
+                                artifact_sha256=artifact_sha,
+                                snapshot={
+                                    **common_snapshot,
+                                    "terminal_status": terminal_status,
+                                },
+                            )
+                        )
+            except (OSError, ValueError, ValidationError, json.JSONDecodeError):
+                for command_id in application_commands:
+                    reasons[command_id].append(
+                        "current apply queue targets are unavailable or unsafe"
+                    )
+        if requested.intersection({"outreach.linkedin.send", "outreach.email.send"}):
+            outreach_records, outreach_reasons = self._outreach_review_target_records()
+            records.extend(
+                record
+                for record in outreach_records
+                if record["command_id"] in requested
+            )
+            for command_id, values in outreach_reasons.items():
+                if command_id in requested:
+                    reasons[command_id].extend(values)
         return records, reasons
 
     def _nightly_review_target(self) -> dict[str, Any]:
@@ -1486,10 +1473,12 @@ class OperatorBackend:
         pipeline_script_sha = hashlib.sha256(
             _read_bounded_bytes(pipeline_script, limit=4 * 1024 * 1024)
         ).hexdigest()
-        pipeline_args = " ".join(_SAFE_NIGHTLY_PIPELINE_ARGS)
+        contract = self._canonical_nightly_contract()
+        pipeline_args = str(contract["pipeline_args_string"])
         wrapper_argv = [
             "--force",
             "--require-production-attestation",
+            "--require-live-delivery-contract",
             "--production-attestation",
             "<server-owned-attestation>",
             "--pipeline-args",
@@ -1499,12 +1488,15 @@ class OperatorBackend:
             "release_attestation_sha256": attestation_sha,
             "nightly_prompt_sha256": script_sha,
             "run_nightly_pipeline_sha256": pipeline_script_sha,
+            "nightly_contract_sha256": contract["script_sha256"],
+            "nightly_contract_stdout_sha256": contract["stdout_sha256"],
+            "nightly_contract_print_argv": contract["print_argv"],
             "wrapper_argv": wrapper_argv,
-            "pipeline_args": list(_SAFE_NIGHTLY_PIPELINE_ARGS),
+            "pipeline_args": contract["pipeline_args"],
             "pipeline_args_string": pipeline_args,
             "delivery_flags": {
-                "execute_sends": False,
-                "track_2_send_linkedin": False,
+                "execute_sends": True,
+                "track_2_send_linkedin": True,
                 "execute_linkedin_followups": False,
             },
             "maximum_runs": 1,
@@ -1512,11 +1504,12 @@ class OperatorBackend:
         artifact_sha = _canonical_binding_sha(binding)
         target = self._make_review_target(
             command_id="nightly.run",
-            target_type="safe_nightly_release",
-            label=f"Safe nightly · release {attestation_sha[:12]}",
+            target_type="production_nightly_release",
+            label=f"Production nightly · release {attestation_sha[:12]}",
             detail=(
-                "One prepare/generate nightly run. Email sends, LinkedIn invites, "
-                "and LinkedIn follow-ups are omitted."
+                "One bounded production run. App-queue invitations and Track 2 "
+                "LinkedIn invitations, replies, and follow-ups are enabled; email "
+                "delivery remains separately recipient-reviewed."
             ),
             artifact_sha256=artifact_sha,
             snapshot=binding,
@@ -1526,6 +1519,130 @@ class OperatorBackend:
             "attestation": str(attestation),
         }
         return target
+
+    def _canonical_nightly_contract(self) -> dict[str, Any]:
+        """Read the attested upstream production argv through its fixed CLI."""
+        python, root = self._resume_surface(
+            "discovery/scripts/nightly_contract.py"
+        )
+        script = _strict_allowlisted_path(
+            root,
+            root / "discovery" / "scripts" / "nightly_contract.py",
+            expect="file",
+        )
+        script_sha = hashlib.sha256(
+            _read_bounded_bytes(script, limit=2 * 1024 * 1024)
+        ).hexdigest()
+        print_argv = [
+            str(python),
+            "discovery/scripts/nightly_contract.py",
+            "print",
+        ]
+        try:
+            completed = subprocess.run(
+                print_argv,
+                cwd=root,
+                env=self._fixed_environment("nightly.run"),
+                capture_output=True,
+                text=False,
+                timeout=10,
+                check=False,
+                shell=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ValidationError(
+                "canonical production-nightly contract is unavailable"
+            ) from error
+        if completed.returncode != 0 or completed.stderr:
+            raise ValidationError(
+                "canonical production-nightly contract did not print cleanly"
+            )
+        stdout = completed.stdout
+        if not isinstance(stdout, bytes) or not (
+            0 < len(stdout) <= _MAX_NIGHTLY_CONTRACT_OUTPUT_BYTES
+        ):
+            raise ValidationError("canonical production-nightly output is invalid")
+        try:
+            decoded = stdout.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValidationError(
+                "canonical production-nightly output is not UTF-8"
+            ) from error
+        pipeline_args = decoded[:-1] if decoded.endswith("\n") else decoded
+        if (
+            not pipeline_args
+            or pipeline_args != pipeline_args.strip()
+            or "\n" in pipeline_args
+            or "\r" in pipeline_args
+        ):
+            raise ValidationError(
+                "canonical production-nightly output is not one argument line"
+            )
+        try:
+            tokens = shlex.split(pipeline_args)
+        except ValueError as error:
+            raise ValidationError(
+                "canonical production-nightly output has invalid quoting"
+            ) from error
+        if shlex.join(tokens) != pipeline_args:
+            raise ValidationError(
+                "canonical production-nightly output is not canonical shell quoting"
+            )
+        self._validate_production_nightly_tokens(tokens)
+        return {
+            "script_sha256": script_sha,
+            "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+            "print_argv": [
+                "<server-owned-python>",
+                "discovery/scripts/nightly_contract.py",
+                "print",
+            ],
+            "pipeline_args": tokens,
+            "pipeline_args_string": pipeline_args,
+        }
+
+    @staticmethod
+    def _validate_production_nightly_tokens(tokens: list[str]) -> None:
+        if not tokens or len(tokens) > _MAX_NIGHTLY_CONTRACT_TOKENS:
+            raise ValidationError("canonical production-nightly argv is unbounded")
+        if any(
+            not token
+            or len(token) > 512
+            or "\x00" in token
+            or "\n" in token
+            or "\r" in token
+            for token in tokens
+        ):
+            raise ValidationError("canonical production-nightly argv is unsafe")
+        present = set(tokens)
+        if not _REQUIRED_PRODUCTION_NIGHTLY_FLAGS.issubset(present):
+            raise ValidationError(
+                "canonical production-nightly argv omits a live-delivery gate"
+            )
+        if _FORBIDDEN_PRODUCTION_NIGHTLY_FLAGS.intersection(present):
+            raise ValidationError(
+                "canonical production-nightly argv enables the deprecated follow-up lane"
+            )
+        for flag in _REQUIRED_PRODUCTION_NIGHTLY_FLAGS:
+            if tokens.count(flag) != 1:
+                raise ValidationError(
+                    "canonical production-nightly argv repeats a live-delivery gate"
+                )
+        for option, expected in (
+            ("--cycle-config", "offcycle_light"),
+            ("--target-sends", "auto"),
+        ):
+            try:
+                index = tokens.index(option)
+                actual = tokens[index + 1]
+            except (ValueError, IndexError) as error:
+                raise ValidationError(
+                    f"canonical production-nightly argv omits {option}"
+                ) from error
+            if actual != expected:
+                raise ValidationError(
+                    f"canonical production-nightly argv has unsafe {option}"
+                )
 
     def _outreach_review_target_records(
         self,
@@ -1914,7 +2031,7 @@ class OperatorBackend:
     def _resolve_current_review_target(
         self, command_id: str, target_id: str
     ) -> dict[str, Any]:
-        records, _ = self._review_target_records()
+        records, _ = self._review_target_records({command_id})
         for target in records:
             if target["command_id"] == command_id and target["target_id"] == target_id:
                 return target
@@ -2043,7 +2160,15 @@ class OperatorBackend:
             raise ConflictError("approved review does not match the selected target")
         if review["state"] != "approved":
             raise ConflictError("selected target requires a current approved review")
-        current = self._resolve_current_review_target(command_id, review["target_id"])
+        try:
+            current = self._resolve_current_review_target(
+                command_id, review["target_id"]
+            )
+        except (NotFoundError, ValidationError) as error:
+            self._mark_review_stale(review, requested_scope="system")
+            raise ConflictError(
+                "approved artifact changed and must be reviewed again"
+            ) from error
         if current["artifact_sha256"] != review["source_artifact_sha256"]:
             self._mark_review_stale(review, requested_scope="system")
             raise ConflictError("approved artifact changed and must be reviewed again")
@@ -2610,6 +2735,7 @@ class OperatorBackend:
         self, job_id: str, parameters: dict[str, Any]
     ) -> None:
         lock_path = self.settings.adapter_mutation_lock_path
+        prior_run_ids: set[str] = set()
         try:
             with lock_path.open("r+b") as handle:
                 try:
@@ -2645,8 +2771,18 @@ class OperatorBackend:
                         or review["target_id"] != target["target_id"]
                         or review["source_artifact_sha256"] != target["artifact_sha256"]
                     ):
-                        raise ConflictError("safe nightly review changed")
-                    argv, cwd, timeout = self._fixed_nightly_argv()
+                        raise ConflictError("production nightly review changed")
+                    execution_binding = target.get("_execution_binding")
+                    pipeline_args = (
+                        execution_binding.get("pipeline_args_string")
+                        if isinstance(execution_binding, dict)
+                        else None
+                    )
+                    if not isinstance(pipeline_args, str) or not pipeline_args:
+                        raise ConflictError(
+                            "canonical production nightly argv is unavailable"
+                        )
+                    argv, cwd, timeout = self._fixed_nightly_argv(pipeline_args)
                     preflight_argv, preflight_cwd = self._preflight_argv()
                     try:
                         preflight = subprocess.run(
@@ -2692,6 +2828,11 @@ class OperatorBackend:
                             lock_snapshot=locks,
                         )
                         return
+                    prior_run_ids = {
+                        str(run.get("run_id") or "")
+                        for run in self.adapter.verified_run_projections(limit=50)
+                        if run.get("run_id")
+                    }
                     self._consume_review_row(
                         review, actor_scope="operator-nightly-executor"
                     )
@@ -2760,20 +2901,95 @@ class OperatorBackend:
                 result_code="reviewed_nightly_spawn_failed",
             )
             return
+        if completed.returncode != 0:
+            self._finish_job(
+                job_id,
+                status="failed",
+                result_code="reviewed_nightly_failed",
+                returncode=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
+            return
+        try:
+            result = self._new_verified_nightly_result(prior_run_ids)
+        except (OSError, ValueError, json.JSONDecodeError):
+            self._finish_job(
+                job_id,
+                status="failed",
+                result_code="reviewed_nightly_evidence_missing",
+                returncode=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
+            return
+
+        health = str(result.get("health") or "attention")
+        delivery_mode = str(result.get("delivery_mode") or "not_reported")
+        if delivery_mode != "full_delivery":
+            status = "failed"
+            result_code = "reviewed_nightly_delivery_contract_mismatch"
+        elif health != "complete":
+            status = "failed"
+            result_code = "reviewed_nightly_incomplete"
+        else:
+            status = "completed"
+            result_code = "reviewed_nightly_completed"
         self._finish_job(
             job_id,
-            status="completed" if completed.returncode == 0 else "failed",
-            result_code=(
-                "reviewed_nightly_completed"
-                if completed.returncode == 0
-                else "reviewed_nightly_failed"
-            ),
+            status=status,
+            result_code=result_code,
             returncode=completed.returncode,
             stdout=completed.stdout,
             stderr=completed.stderr,
+            result_run_id=str(result["run_id"]),
+            result_health=health,
+            result_report_sha256=str(result["report_sha256"]),
+            result_delivery_mode=delivery_mode,
         )
 
-    def _fixed_nightly_argv(self) -> tuple[list[str], Path, int]:
+    def _new_verified_nightly_result(
+        self, prior_run_ids: set[str]
+    ) -> dict[str, str]:
+        """Bind one operator execution to one newly verified exact-run report."""
+        candidates = [
+            run
+            for run in self.adapter.verified_run_projections(limit=50)
+            if str(run.get("run_id") or "") not in prior_run_ids
+        ]
+        if len(candidates) != 1:
+            raise ValueError("nightly execution did not produce one exact new run")
+        run = candidates[0]
+        run_id = str(run.get("run_id") or "")
+        if not re.fullmatch(r"\d{8}-\d{6}", run_id):
+            raise ValueError("nightly result run id is invalid")
+        report = run.get("report")
+        evidence = run.get("evidence", {}).get("outreach_report")
+        delivery = run.get("delivery_contract")
+        if not isinstance(report, dict) or report.get("status") != "valid":
+            raise ValueError("nightly result report projection is invalid")
+        if not isinstance(evidence, dict) or evidence.get("state") != "valid":
+            raise ValueError("nightly result report evidence is invalid")
+        report_sha256 = evidence.get("sha256")
+        if not isinstance(report_sha256, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", report_sha256
+        ):
+            raise ValueError("nightly result report hash is invalid")
+        delivery_mode = (
+            str(delivery.get("mode") or "not_reported")
+            if isinstance(delivery, dict)
+            else "not_reported"
+        )
+        return {
+            "run_id": run_id,
+            "health": str(run.get("status") or "attention"),
+            "report_sha256": report_sha256,
+            "delivery_mode": delivery_mode,
+        }
+
+    def _fixed_nightly_argv(
+        self, pipeline_args: str
+    ) -> tuple[list[str], Path, int]:
         if not self.settings.allow_reviewed_actions:
             raise ValidationError("reviewed actions are disabled")
         if not self.settings.attestation_path:
@@ -2784,16 +3000,24 @@ class OperatorBackend:
         attestation = self.settings.attestation_path.resolve(strict=True)
         if not attestation.is_file():
             raise ValidationError("production attestation is unavailable")
+        try:
+            tokens = shlex.split(pipeline_args)
+        except ValueError as error:
+            raise ValidationError("canonical production-nightly argv is invalid") from error
+        if shlex.join(tokens) != pipeline_args:
+            raise ValidationError("canonical production-nightly argv changed")
+        self._validate_production_nightly_tokens(tokens)
         return (
             [
                 str(python),
                 "discovery/scripts/nightly_prompt.py",
                 "--force",
                 "--require-production-attestation",
+                "--require-live-delivery-contract",
                 "--production-attestation",
                 str(attestation),
                 "--pipeline-args",
-                " ".join(_SAFE_NIGHTLY_PIPELINE_ARGS),
+                pipeline_args,
             ],
             root,
             _COMMAND_TIMEOUTS["nightly.run"],
@@ -4028,7 +4252,7 @@ class OperatorBackend:
             self._nightly_review_target()
         except (OSError, ValueError, ValidationError):
             reasons.append(
-                "the reviewed safe-nightly script or release attestation changed"
+                "the reviewed production-nightly script or release attestation changed"
             )
         return not reasons, reasons
 
@@ -4800,6 +5024,10 @@ class OperatorBackend:
         stdout: bytes = b"",
         stderr: bytes = b"",
         lock_snapshot: dict[str, Any] | None = None,
+        result_run_id: str = "",
+        result_health: str = "",
+        result_report_sha256: str = "",
+        result_delivery_mode: str = "",
     ) -> None:
         values: dict[str, Any] = {
             "status": status,
@@ -4810,6 +5038,10 @@ class OperatorBackend:
             "stderr_sha256": hashlib.sha256(stderr).hexdigest() if stderr else "",
             "stdout_lines": len(stdout.splitlines()),
             "stderr_lines": len(stderr.splitlines()),
+            "result_run_id": result_run_id,
+            "result_health": result_health,
+            "result_report_sha256": result_report_sha256,
+            "result_delivery_mode": result_delivery_mode,
         }
         if lock_snapshot is not None:
             values["lock_snapshot_json"] = json.dumps(lock_snapshot, sort_keys=True)
@@ -4849,6 +5081,10 @@ class OperatorBackend:
             "preflight_stdout_sha256": row.get("preflight_stdout_sha256", ""),
             "preflight_stderr_sha256": row.get("preflight_stderr_sha256", ""),
             "result_code": row["result_code"],
+            "result_run_id": row.get("result_run_id", ""),
+            "result_health": row.get("result_health", ""),
+            "result_report_sha256": row.get("result_report_sha256", ""),
+            "result_delivery_mode": row.get("result_delivery_mode", ""),
             "summary": _operator_job_summary(
                 row["status"], row["result_code"]
             ),
@@ -5182,6 +5418,7 @@ class OperatorBackend:
         reports = []
         for run in run_projections:
             report = run.get("report", {})
+            delivery = run.get("delivery_contract", {})
             reports.append(
                 {
                     "run_id": run.get("run_id"),
@@ -5189,6 +5426,13 @@ class OperatorBackend:
                     "started_at": run.get("started_at"),
                     "completed_at": run.get("completed_at"),
                     "failure_count": run.get("failure_count", 0),
+                    "run_status": report.get("run_status", "not_reported"),
+                    "track_2_status": report.get("track_2_status", "not_reported"),
+                    "delivery_mode": (
+                        delivery.get("mode", "not_reported")
+                        if isinstance(delivery, dict)
+                        else "not_reported"
+                    ),
                     "source_count": len(run.get("sources", [])),
                     "workspace_counts": _allowlisted_numeric_mapping(
                         report.get("workspace_counts"), _WORKSPACE_COUNT_FIELDS
@@ -5343,10 +5587,13 @@ def _operator_job_summary(status: str, result_code: str) -> str:
         "lifecycle_busy": "The reviewed lifecycle transition found an upstream lock busy; the approval remains consumed and requires reconciliation.",
         "lifecycle_validation_failed": "The reviewed lifecycle transition failed upstream validation.",
         "lifecycle_rolled_back": "The reviewed lifecycle transition failed and the upstream transaction rolled back.",
-        "reviewed_nightly_completed": "The reviewed prepare/generate nightly completed; delivery flags were omitted.",
-        "reviewed_nightly_failed": "The reviewed safe nightly returned a failure status.",
-        "reviewed_nightly_timeout": "The reviewed safe nightly reached its bounded timeout; approval remains consumed.",
-        "reviewed_nightly_spawn_failed": "The reviewed safe nightly could not start; approval remains consumed.",
+        "reviewed_nightly_completed": "The reviewed production nightly completed and its exact report is healthy.",
+        "reviewed_nightly_incomplete": "The production process exited zero, but its exact report is failed or incomplete.",
+        "reviewed_nightly_evidence_missing": "The production process exited zero without exactly one new verified summary, manifest, and report chain.",
+        "reviewed_nightly_delivery_contract_mismatch": "The exact run evidence does not prove the reviewed full-delivery contract.",
+        "reviewed_nightly_failed": "The reviewed production nightly returned a failure status.",
+        "reviewed_nightly_timeout": "The reviewed production nightly reached its bounded timeout; approval remains consumed.",
+        "reviewed_nightly_spawn_failed": "The reviewed production nightly could not start; approval remains consumed.",
         "reviewed_nightly_preflight_failed": "Production preflight failed before approval consumption; no nightly process started.",
         "reviewed_action_preflight_failed": "Production attestation changed or could not be revalidated before approval consumption; no consequential action started.",
         "apply_assist_run_completed": "The reviewed apply-assist runner returned successfully. Inspect its browser/result state before the human-owned final Submit.",

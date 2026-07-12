@@ -1757,6 +1757,19 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
             transition_script.write_text("# fixed lifecycle fixture\n", encoding="utf-8")
             nightly_script = resume / "discovery" / "scripts" / "nightly_prompt.py"
             nightly_script.write_text("# fixed nightly wrapper fixture\n", encoding="utf-8")
+            contract_args = (
+                "--cycle-config offcycle_light --generate --prepare-outreach "
+                "--execute-sends --target-sends auto "
+                "--execute-track-2-daily-plan --track-2-send-linkedin"
+            )
+            contract_script = (
+                resume / "discovery" / "scripts" / "nightly_contract.py"
+            )
+            contract_script.write_text(
+                "import sys\n"
+                f"print({contract_args!r}) if sys.argv[1:] == ['print'] else sys.exit(2)\n",
+                encoding="utf-8",
+            )
             (resume / "discovery" / "scripts" / "run_nightly_pipeline.py").write_text(
                 "# fixed nightly pipeline fixture\n", encoding="utf-8"
             )
@@ -1814,6 +1827,23 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
             self.assertEqual(lanes["outreach.email.send"]["targets_total"], 0)
 
             nightly_target = lanes["nightly.run"]["targets"][0]
+            private_target = backend._nightly_review_target()
+            self.assertEqual(
+                private_target["_execution_binding"]["pipeline_args_string"],
+                contract_args,
+            )
+            self.assertEqual(
+                len(private_target["_execution_binding"]["nightly_contract_sha256"]),
+                64,
+            )
+            self.assertEqual(
+                len(
+                    private_target["_execution_binding"][
+                        "nightly_contract_stdout_sha256"
+                    ]
+                ),
+                64,
+            )
             expiring = backend.create_review(
                 command_id="nightly.run",
                 target_id=nightly_target["target_id"],
@@ -1882,8 +1912,26 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
 
             nightly_calls = 0
 
+            def is_contract_print(argv: object) -> bool:
+                return (
+                    isinstance(argv, list)
+                    and len(argv) >= 3
+                    and argv[1] == "discovery/scripts/nightly_contract.py"
+                    and argv[2] == "print"
+                )
+
+            def contract_print(argv: object) -> subprocess.CompletedProcess:
+                return subprocess.CompletedProcess(
+                    args=argv,
+                    returncode=0,
+                    stdout=(contract_args + "\n").encode(),
+                    stderr=b"",
+                )
+
             def nightly_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
                 nonlocal nightly_calls
+                if is_contract_print(args[0]):
+                    return contract_print(args[0])
                 nightly_calls += 1
                 if nightly_calls == 1:
                     self.assertIn("--production-check-only", args[0])
@@ -1900,13 +1948,22 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
                 return subprocess.CompletedProcess(
-                    args=args[0], returncode=0, stdout=b"safe nightly\n", stderr=b""
+                    args=args[0], returncode=0, stdout=b"production nightly\n", stderr=b""
                 )
 
             with patch(
                 "recruiting_companion.operator_backend.subprocess.run",
                 side_effect=nightly_run,
-            ) as nightly_runner:
+            ) as nightly_runner, patch.object(
+                backend,
+                "_new_verified_nightly_result",
+                return_value={
+                    "run_id": "20260712-190000",
+                    "health": "complete",
+                    "report_sha256": "a" * 64,
+                    "delivery_mode": "full_delivery",
+                },
+            ):
                 nightly_job = backend.submit_job(
                     command_id="nightly.run",
                     confirmation="RUN_REVIEWED_NIGHTLY",
@@ -1922,16 +1979,79 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
             nightly_argv = nightly_runner.call_args_list[-1].args[0]
             self.assertEqual(nightly_argv[1], "discovery/scripts/nightly_prompt.py")
             self.assertIn("--require-production-attestation", nightly_argv)
+            self.assertIn("--require-live-delivery-contract", nightly_argv)
             self.assertIn("--pipeline-args", nightly_argv)
             pipeline_args = nightly_argv[nightly_argv.index("--pipeline-args") + 1]
             self.assertIn("--execute-track-2-daily-plan", pipeline_args)
-            self.assertIn("--target-sends 0", pipeline_args)
-            self.assertNotIn("--execute-sends", pipeline_args)
-            self.assertNotIn("--track-2-send-linkedin", pipeline_args)
+            self.assertIn("--target-sends auto", pipeline_args)
+            self.assertIn("--execute-sends", pipeline_args)
+            self.assertIn("--track-2-send-linkedin", pipeline_args)
             self.assertNotIn("--execute-linkedin-followups", pipeline_args)
             self.assertIs(nightly_runner.call_args_list[-1].kwargs["shell"], False)
             self.assertEqual(nightly_job["preflight_returncode"], 0)
             self.assertTrue(nightly_job["preflight_stdout_sha256"])
+            self.assertEqual(nightly_job["result_run_id"], "20260712-190000")
+            self.assertEqual(nightly_job["result_health"], "complete")
+            self.assertEqual(nightly_job["result_report_sha256"], "a" * 64)
+            self.assertEqual(nightly_job["result_delivery_mode"], "full_delivery")
+
+            incomplete_review = backend.create_review(
+                command_id="nightly.run",
+                target_id=nightly_target["target_id"],
+                requested_scope="web",
+            )
+            incomplete_review = backend.transition_review(
+                incomplete_review["id"],
+                transition="review",
+                confirmation="REVIEW_EXACT_TARGET",
+                requested_scope="web",
+            )
+            incomplete_review = backend.transition_review(
+                incomplete_review["id"],
+                transition="approve",
+                confirmation="APPROVE_EXACT_TARGET",
+                requested_scope="web",
+            )
+            with patch(
+                "recruiting_companion.operator_backend.subprocess.run",
+                side_effect=lambda argv, **kwargs: (
+                    contract_print(argv)
+                    if is_contract_print(argv)
+                    else subprocess.CompletedProcess(
+                        args=argv,
+                        returncode=0,
+                        stdout=b"process complete\n",
+                        stderr=b"",
+                    )
+                ),
+            ), patch.object(
+                backend,
+                "_new_verified_nightly_result",
+                return_value={
+                    "run_id": "20260712-193000",
+                    "health": "attention",
+                    "report_sha256": "b" * 64,
+                    "delivery_mode": "full_delivery",
+                },
+            ):
+                incomplete_job = backend.submit_job(
+                    command_id="nightly.run",
+                    confirmation="RUN_REVIEWED_NIGHTLY",
+                    parameters={
+                        "review_id": incomplete_review["id"],
+                        "target_id": nightly_target["target_id"],
+                    },
+                    requested_scope="web",
+                )
+                incomplete_job = self._wait_for_job(
+                    backend, incomplete_job["id"]
+                )
+            self.assertEqual(incomplete_job["status"], "failed")
+            self.assertEqual(
+                incomplete_job["result_code"], "reviewed_nightly_incomplete"
+            )
+            self.assertEqual(incomplete_job["returncode"], 0)
+            self.assertEqual(incomplete_job["result_run_id"], "20260712-193000")
 
             failed_review = backend.create_review(
                 command_id="nightly.run",
@@ -1952,8 +2072,15 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
             )
             with patch(
                 "recruiting_companion.operator_backend.subprocess.run",
-                return_value=subprocess.CompletedProcess(
-                    args=[], returncode=78, stdout=b"", stderr=b"dirty checkout"
+                side_effect=lambda argv, **kwargs: (
+                    contract_print(argv)
+                    if is_contract_print(argv)
+                    else subprocess.CompletedProcess(
+                        args=argv,
+                        returncode=78,
+                        stdout=b"",
+                        stderr=b"dirty checkout",
+                    )
                 ),
             ):
                 failed_job = backend.submit_job(
@@ -1971,6 +2098,34 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
             )
             self.assertEqual(
                 backend.get_review(failed_review["id"])["state"], "approved"
+            )
+
+            changed_contract_args = (
+                contract_args + " --outreach-resolve-limit 21"
+            )
+            with patch(
+                "recruiting_companion.operator_backend.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=(changed_contract_args + "\n").encode(),
+                    stderr=b"",
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    ConflictError, "approved artifact changed"
+                ):
+                    backend.submit_job(
+                        command_id="nightly.run",
+                        confirmation="RUN_REVIEWED_NIGHTLY",
+                        parameters={
+                            "review_id": failed_review["id"],
+                            "target_id": nightly_target["target_id"],
+                        },
+                        requested_scope="web",
+                    )
+            self.assertEqual(
+                backend.get_review(failed_review["id"])["state"], "stale"
             )
 
             target = lanes["application.status.applied"]["targets"][0]
@@ -2073,6 +2228,8 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
             lifecycle_calls = 0
             def lifecycle_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
                 nonlocal lifecycle_calls
+                if is_contract_print(args[0]):
+                    return contract_print(args[0])
                 lifecycle_calls += 1
                 if "--production-check-only" in args[0]:
                     self.assertEqual(
@@ -2105,9 +2262,14 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
                 lifecycle_job = self._wait_for_job(backend, lifecycle_job["id"])
             self.assertEqual(lifecycle_job["status"], "completed")
             self.assertEqual(lifecycle_calls, 2)
+            lifecycle_argvs = [
+                call.args[0]
+                for call in runner.call_args_list
+                if not is_contract_print(call.args[0])
+            ]
             self.assertIn(
                 "--production-check-only",
-                runner.call_args_list[0].args[0],
+                lifecycle_argvs[0],
             )
             self.assertEqual(
                 lifecycle_job["result_code"], "application_archived_applied"
@@ -2162,8 +2324,15 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
             )
             with patch(
                 "recruiting_companion.operator_backend.subprocess.run",
-                return_value=subprocess.CompletedProcess(
-                    args=[], returncode=78, stdout=b"", stderr=b"dirty release"
+                side_effect=lambda argv, **kwargs: (
+                    contract_print(argv)
+                    if is_contract_print(argv)
+                    else subprocess.CompletedProcess(
+                        args=argv,
+                        returncode=78,
+                        stdout=b"",
+                        stderr=b"dirty release",
+                    )
                 ),
             ) as blocked_runner:
                 blocked_job = backend.submit_job(
@@ -2176,7 +2345,16 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
                     requested_scope="local",
                 )
                 blocked_job = self._wait_for_job(backend, blocked_job["id"])
-            self.assertEqual(blocked_runner.call_count, 1)
+            self.assertEqual(
+                len(
+                    [
+                        call
+                        for call in blocked_runner.call_args_list
+                        if not is_contract_print(call.args[0])
+                    ]
+                ),
+                1,
+            )
             self.assertEqual(
                 blocked_job["result_code"], "reviewed_action_preflight_failed"
             )
@@ -2842,7 +3020,9 @@ class ExistingAdapterTestCase(unittest.TestCase):
                         "invite_totals": {"sent": 1},
                         "pending_review_count": 2,
                         "track_2_returncode": None,
-                        "track_2_failed": False,
+                        "track_2_failed": True,
+                        "track_2_execution": {"status": "partial_failed"},
+                        "run_status": "failed_or_incomplete",
                     }
                 ),
                 encoding="utf-8",
@@ -3061,6 +3241,14 @@ class ExistingAdapterTestCase(unittest.TestCase):
             )
             snapshot = ExistingEngineAdapter(settings).snapshot()
             self.assertEqual(snapshot["run_snapshot"]["run_id"], run_id)
+            self.assertEqual(
+                snapshot["run_snapshot"]["report"]["run_status"],
+                "failed_or_incomplete",
+            )
+            self.assertEqual(
+                snapshot["run_snapshot"]["report"]["track_2_status"],
+                "partial_failed",
+            )
             queue = snapshot["run_snapshot"]["queue"]
             self.assertEqual(queue["decision_total"], 5)
             self.assertEqual(

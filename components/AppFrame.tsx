@@ -19,6 +19,7 @@ import {
 import type {
   OperatorActionResult,
   OperatorOverview,
+  OperatorReportDocument,
   OperatorReview,
   OperatorReviewResult,
   OperatorReviewTargetDetail,
@@ -107,8 +108,8 @@ const navItems: { id: AppView; label: string; glyph: string; href: string }[] = 
 function statusLabel(state: ConnectionState): string {
   if (state === "connected") return "Local companion online";
   if (state === "checking") return "Checking companion";
-  if (state === "error") return "Companion needs attention";
-  return "Private preview workspace";
+  if (state === "error") return "Session expired or unavailable";
+  return "Not connected · no live data";
 }
 
 function safeSnapshot(value: unknown): DashboardSnapshot | null {
@@ -393,6 +394,7 @@ export function AppFrame({ view }: { view: AppView }) {
   const [existingSnapshot, setExistingSnapshot] = useState<ExistingEngineSnapshot | null>(null);
   const [operatorOverview, setOperatorOverview] = useState<OperatorOverview | null>(null);
   const [preferencesData, setPreferencesData] = useState<Record<string, unknown>>({});
+  const [autoReviewCommandId, setAutoReviewCommandId] = useState("");
 
   const loadDashboard = useCallback(async (nextConfig: CompanionConfig) => {
     try {
@@ -460,6 +462,14 @@ export function AppFrame({ view }: { view: AppView }) {
   }, [loadDashboard]);
 
   useEffect(() => {
+    if (view !== "runs") return;
+    const requested = new URLSearchParams(window.location.search).get("start");
+    if (requested !== "nightly") return;
+    const timer = window.setTimeout(() => setAutoReviewCommandId("nightly.run"), 0);
+    return () => window.clearTimeout(timer);
+  }, [view]);
+
+  useEffect(() => {
     if (!mobileNav) return;
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") setMobileNav(false);
@@ -496,10 +506,7 @@ export function AppFrame({ view }: { view: AppView }) {
       return;
     }
     if (workspaceMode === "existing") {
-      setRunning(true);
-      setNotice("Refreshing your local cockpit, exact run evidence, and capability guards. Use the reviewed nightly lane to start one attested no-delivery cycle.");
-      await loadDashboard(config);
-      setRunning(false);
+      window.location.assign("/app/runs?start=nightly");
       return;
     }
     setRunning(true);
@@ -516,6 +523,14 @@ export function AppFrame({ view }: { view: AppView }) {
     } finally {
       setRunning(false);
     }
+  };
+
+  const refreshCockpit = async () => {
+    if (connection !== "connected") return;
+    setRunning(true);
+    setNotice("Refreshing live local evidence and execution guards…");
+    await loadDashboard(config);
+    setRunning(false);
   };
 
   const saveConfig = async (nextConfig: CompanionConfig) => {
@@ -704,6 +719,24 @@ export function AppFrame({ view }: { view: AppView }) {
     }
   };
 
+  const loadOperatorReport = async (runId: string): Promise<OperatorReportDocument | null> => {
+    if (connection !== "connected" || workspaceMode !== "existing") {
+      setNotice("Pair this Mac before opening a private exact report.");
+      return null;
+    }
+    try {
+      const result = await apiRequest<{ report?: OperatorReportDocument }>(
+        config,
+        `/api/v1/operator/reports/${encodeURIComponent(runId)}/html`,
+      );
+      if (!result.report) throw new Error("The companion returned no exact report document.");
+      return result.report;
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The exact report could not be opened.");
+      return null;
+    }
+  };
+
   const importJobs = async (file: File, sourceLabel: string) => {
     if (connection !== "connected") {
       setNotice("Pair the local companion before importing a private source file.");
@@ -764,6 +797,8 @@ export function AppFrame({ view }: { view: AppView }) {
     onCreateReview: createOperatorReview,
     onUpdateReviewContent: updateOperatorReviewContent,
     onTransitionReview: transitionOperatorReview,
+    onLoadReport: loadOperatorReport,
+    autoReviewCommandId,
   };
 
   return (
@@ -789,7 +824,7 @@ export function AppFrame({ view }: { view: AppView }) {
           <span className={`connection-dot dot-${connection}`} />
           <div>
             <small>Workspace</small>
-            <strong>{snapshot.profile.displayName}</strong>
+            <strong>{connection === "connected" ? snapshot.profile.displayName : connection === "checking" ? "Checking this Mac" : "No live workspace"}</strong>
           </div>
         </div>
 
@@ -833,9 +868,10 @@ export function AppFrame({ view }: { view: AppView }) {
             <span className={`connection-pill connection-${connection}`}>
               <i /> {statusLabel(connection)}
             </span>
-            <button className="run-button" type="button" onClick={runEngine} disabled={running} aria-label={workspaceMode === "existing" ? "Refresh the local operator cockpit" : "Run the portable engine"}>
-              <span>{running ? (workspaceMode === "existing" ? "Refreshing" : "Running") : (workspaceMode === "existing" ? "Refresh cockpit" : "Run engine")}</span>
-              <b aria-hidden="true">{running ? "…" : workspaceMode === "existing" ? "↻" : "▶"}</b>
+            {connection === "connected" && workspaceMode === "existing" ? <button className="refresh-button" type="button" onClick={refreshCockpit} disabled={running}>↻ Refresh</button> : null}
+            <button className="run-button" type="button" onClick={runEngine} disabled={running} aria-label={workspaceMode === "existing" ? "Open the reviewed end-to-end nightly run" : "Run the portable engine"}>
+              <span>{running ? "Working" : workspaceMode === "existing" ? "Run E2E" : connection === "connected" ? "Run engine" : "Connect to run"}</span>
+              <b aria-hidden="true">{running ? "…" : "▶"}</b>
             </button>
           </div>
         </header>
@@ -851,6 +887,10 @@ export function AppFrame({ view }: { view: AppView }) {
         ) : null}
 
         <div className="app-content">
+          {view !== "settings" && connection !== "connected" ? (
+            <ConnectionGate connection={connection} view={view} />
+          ) : (
+          <>
           {view === "dashboard" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <Dashboard snapshot={snapshot} mode={mode} workspaceMode={workspaceMode} existingEngine={existingEngine} existingSnapshot={existingSnapshot} />) : null}
           {view === "sources" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <SourcesView snapshot={snapshot} onImport={importJobs} />) : null}
           {view === "queue" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <QueueView snapshot={snapshot} />) : null}
@@ -874,9 +914,27 @@ export function AppFrame({ view }: { view: AppView }) {
               onSave={saveConfig}
             />
           ) : null}
+          </>
+          )}
         </div>
       </section>
     </main>
+  );
+}
+
+function ConnectionGate({ connection, view }: { connection: ConnectionState; view: AppView }) {
+  const checking = connection === "checking";
+  return (
+    <section className="operator-empty app-panel connection-gate" aria-live="polite">
+      <span className="operator-kicker">{checking ? "Checking private companion" : "Live data is disconnected"}</span>
+      <h2>{checking ? "Looking for your local recruiting engine…" : `Connect this Mac to open ${navItems.find((item) => item.id === view)?.label.toLowerCase() || "this workspace"}.`}</h2>
+      <p>
+        {checking
+          ? "No records will appear until the authenticated local workspace responds."
+          : "No company, queue, run, or report shown on this screen is mock data. Pair the local companion to load your real workspace; fictional preview records are no longer rendered on operational routes."}
+      </p>
+      {!checking ? <div><a href="/app/settings">Connect this Mac →</a><a href="/install">Open pairing guide ↗</a></div> : null}
+    </section>
   );
 }
 
@@ -1337,7 +1395,7 @@ function SettingsView({
   return (
     <div className="settings-layout">
       <section className="app-panel settings-card">
-        <PageLead eyebrow="Device pairing" title="Connect the private companion." body="The loopback address may persist; the hosted app keeps only a short-lived token in this tab session. Your documents and records stay in the local companion." />
+        <PageLead eyebrow="Device pairing" title="Connect the private companion." body="The loopback address may persist; the hosted app keeps a 12-hour token only in this tab session so a full nightly run can finish without disconnecting. Your documents and records stay in the local companion." />
         {connection === "connected" ? (
           <div className="pairing-connected-card" role="status">
             <span className="connection-dot dot-connected" />

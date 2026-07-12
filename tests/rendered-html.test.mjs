@@ -64,15 +64,15 @@ test("server-renders architecture, source state, and guardrails", async () => {
   assert.match(html, /Product Strategy/);
 });
 
-test("server-renders the working command center and all human gates", async () => {
+test("server-renders a truthful connection gate before operational data", async () => {
   const response = await render("/app");
   assert.equal(response.status, 200);
 
   const html = await response.text();
   assert.match(html, /Command center/);
-  assert.match(html, /Fictional preview data/);
-  assert.match(html, /Preview run state/);
-  assert.match(html, /Pair the local companion/);
+  assert.match(html, /Checking private companion/);
+  assert.match(html, /No records will appear until the authenticated local workspace responds/);
+  assert.doesNotMatch(html, /Northstar Labs|Parcel Works|Signal House/);
   assert.match(html, /Close navigation/);
   assert.doesNotMatch(html, /auto-send/i);
 });
@@ -82,9 +82,8 @@ test("server-renders the private operator cockpit routes without private data", 
     const response = await render(path);
     assert.equal(response.status, 200);
     const html = await response.text();
-    assert.match(html, /Private operator mode/);
-    assert.match(html, /Pair the local companion/);
-    assert.match(html, /Connect this Mac/);
+    assert.match(html, /Checking private companion/);
+    assert.match(html, /No records will appear until the authenticated local workspace responds/);
     assert.doesNotMatch(html, /\/Users\/|@gmail\.com|linkedin\.com\/in\//i);
   }
 });
@@ -100,15 +99,14 @@ test("server-renders private first-run onboarding", async () => {
   assert.match(html, /Private pairing/);
 });
 
-test("server-renders truthful source setup and imports", async () => {
+test("server-renders no source records before the local workspace is authenticated", async () => {
   const response = await render("/app/sources");
   assert.equal(response.status, 200);
 
   const html = await response.text();
-  assert.match(html, /Source control/);
-  assert.match(html, /Handshake/);
-  assert.match(html, /JobSpy/);
-  assert.match(html, /public extension does not scrape or automate LinkedIn/i);
+  assert.match(html, /Checking private companion/);
+  assert.match(html, /No records will appear until the authenticated local workspace responds/);
+  assert.doesNotMatch(html, /Northstar Labs|Parcel Works|Signal House/);
 });
 
 test("server-renders the local-first privacy contract", async () => {

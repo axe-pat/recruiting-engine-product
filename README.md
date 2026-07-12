@@ -14,7 +14,7 @@ The product now has three cooperating surfaces:
 
 | Surface | Responsibility | Data boundary |
 |---|---|---|
-| Hosted command center | Onboarding, dashboards, sources, queues, runs, applications, outreach review, and reports | Static preview until paired |
+| Hosted command center | Onboarding, dashboards, sources, queues, runs, applications, outreach review, and full exact reports | Connection gate until paired; real local data only on operational routes |
 | Local companion | SQLite system of record, document storage, pairing, imports, deterministic portable runs, existing-engine evidence, and audited fixed actions | User device only |
 | Chrome companion | Explicit page/paste intake and recipient-plus-draft approval | Device-local; no send action |
 
@@ -28,7 +28,7 @@ The original operating depth remains in two source engines:
 ## Product architecture
 
 ```text
-Hosted command center (public code, fictional preview)
+Hosted command center (public code, no operational data while unpaired)
                 │
                 │ one-time loopback pairing
                 ▼
@@ -44,7 +44,8 @@ Chrome MV3 side panel
 ```
 
 The website never becomes the database. It persists only a loopback origin; a
-30-minute web token lives in tab-scoped session storage. Private documents and
+12-hour web token lives in tab-scoped session storage so a full nightly cycle can
+finish without losing its authenticated result view. Private documents and
 operational records go directly to the companion running on that device.
 
 ## Product routes
@@ -56,13 +57,15 @@ operational records go directly to the companion running on that device.
 - `/app/accounts` — real account portfolio, action queue, tiers, and stages;
 - `/app/stories` — private story, positioning, and communication inventories;
 - `/app/operations` — fixed local capabilities, production guards, and job history;
-- `/app/runs` and `/app/reports` — run-scoped evidence and decision briefs;
+- `/app/runs` and `/app/reports` — reviewed no-delivery E2E execution, run-scoped evidence, and sandboxed full exact reports;
 - `/app/applications` and `/app/outreach` — execution state and full-draft approval;
 - `/app/settings` — pairing, portable/existing mode, and engine-binding status;
 - `/story`, `/architecture`, and `/privacy` — product narrative, system design, and data policy.
 
-Every unpaired route uses explicitly fictional records. Pairing replaces the
-preview with the user's local data; it never mixes the two.
+Unpaired operational routes render a hard connection gate and no company, queue,
+run, or report rows. Fictional examples remain confined to public product-story
+surfaces and code fixtures; they are never presented as an operator workspace or
+mixed with local data.
 
 ## Start the working product locally
 

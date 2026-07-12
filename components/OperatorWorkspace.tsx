@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   OperatorActionResult,
@@ -8,6 +8,7 @@ import type {
   OperatorOverview,
   OperatorQueueAction,
   OperatorQueueItem,
+  OperatorReportDocument,
   OperatorReview,
   OperatorReviewLane,
   OperatorReviewResult,
@@ -37,6 +38,8 @@ type OperatorWorkspaceProps = {
   onCreateReview: (commandId: string, targetId: string, reviewedText: string, reviewedSubject: string) => Promise<OperatorReview | null>;
   onUpdateReviewContent: (reviewId: string, reviewedText: string, reviewedSubject: string, confirmation: string) => Promise<OperatorReviewResult | null>;
   onTransitionReview: (reviewId: string, transition: "review" | "approve" | "revoke", confirmation: string) => Promise<OperatorReview | null>;
+  onLoadReport: (runId: string) => Promise<OperatorReportDocument | null>;
+  autoReviewCommandId?: string;
 };
 
 const reviewContentUpdatePhrase = "UPDATE_EXACT_REVIEW_CONTENT";
@@ -237,6 +240,8 @@ export function OperatorWorkspace({
   onCreateReview,
   onUpdateReviewContent,
   onTransitionReview,
+  onLoadReport,
+  autoReviewCommandId,
 }: OperatorWorkspaceProps) {
   const [selected, setSelected] = useState<OperatorCommand | null>(null);
   const [selectedParameters, setSelectedParameters] = useState<Record<string, unknown>>({});
@@ -250,6 +255,9 @@ export function OperatorWorkspace({
   const [reviewedText, setReviewedText] = useState("");
   const [reviewConfirmation, setReviewConfirmation] = useState("");
   const [reviewBusy, setReviewBusy] = useState(false);
+  const autoReviewAttempted = useRef("");
+  const [reportDocument, setReportDocument] = useState<OperatorReportDocument | null>(null);
+  const [reportLoadingRunId, setReportLoadingRunId] = useState("");
 
   const assets = asRecord(overview?.assets);
   const workbooks = asRecord(assets.workbooks);
@@ -259,8 +267,8 @@ export function OperatorWorkspace({
   const reports = asRecord(assets.daily_reports);
   const sources = asRecord(assets.source_metrics);
   const commands = normalizeCommands(overview?.capabilities?.commands ?? []);
-  const reviewLanes = overview?.review_queue?.lanes ?? [];
-  const recentReviews = overview?.review_queue?.recent_reviews ?? [];
+  const reviewLanes = useMemo(() => overview?.review_queue?.lanes ?? [], [overview?.review_queue?.lanes]);
+  const recentReviews = useMemo(() => overview?.review_queue?.recent_reviews ?? [], [overview?.review_queue?.recent_reviews]);
   const items = queueItems(queue);
   const copy = viewCopy[view];
   const visibleReviewLanes = reviewLanes.filter((lane) => {
@@ -305,7 +313,7 @@ export function OperatorWorkspace({
     setSelected(command);
   };
 
-  const selectReviewTarget = async (target: OperatorReviewTarget) => {
+  const selectReviewTarget = useCallback(async (target: OperatorReviewTarget) => {
     setReviewBusy(true);
     setReviewConfirmation("");
     const existing = recentReviews.find((review) =>
@@ -330,7 +338,25 @@ export function OperatorWorkspace({
       setReviewedText(detail.draft_text || "");
     }
     setReviewBusy(false);
-  };
+  }, [onLoadReview, onLoadReviewTarget, recentReviews]);
+
+  useEffect(() => {
+    if (!autoReviewCommandId || reviewTarget || reviewBusy) return;
+    const lane = reviewLanes.find((candidate) => candidate.command_id === autoReviewCommandId);
+    const target = lane?.targets?.[0];
+    const attemptKey = `${overview?.generated_at || "loading"}:${autoReviewCommandId}:${target?.target_id || lane?.state || "missing"}`;
+    if (autoReviewAttempted.current === attemptKey) return;
+    autoReviewAttempted.current = attemptKey;
+    if (!target) {
+      if (overview?.generated_at) {
+        const message = lane?.reason || "No exact reviewed nightly target is available right now.";
+        window.setTimeout(() => setActionMessage(message), 0);
+      }
+      return;
+    }
+    const timer = window.setTimeout(() => { void selectReviewTarget(target); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [autoReviewCommandId, overview?.generated_at, reviewBusy, reviewLanes, reviewTarget, selectReviewTarget]);
 
   const advanceReview = async () => {
     if (!reviewTarget) return;
@@ -410,6 +436,13 @@ export function OperatorWorkspace({
     setReviewBusy(false);
   };
 
+  const openExactReport = async (runId: string) => {
+    setReportLoadingRunId(runId);
+    const report = await onLoadReport(runId);
+    setReportLoadingRunId("");
+    if (report) setReportDocument(report);
+  };
+
   if (!connected || !overview) {
     return (
       <section className="operator-empty app-panel">
@@ -456,9 +489,11 @@ export function OperatorWorkspace({
       {view === "applications" ? <ApplicationHistorySurface workbooks={workbooks} commands={commands} onSelect={selectCommand} /> : null}
       {view === "stories" ? <StorySurface storyComms={storyComms} commands={commands} onSelect={selectCommand} /> : null}
       {view === "outreach" ? <CommunicationSurface storyComms={storyComms} commands={commands} onSelect={selectCommand} /> : null}
-      {view === "reports" || view === "sources" ? <ReportSurface reports={reports} sources={sources} commands={commands} onSelect={selectCommand} showSources={view === "sources"} /> : null}
-      {view === "runs" ? <VerifiedRunsSurface reports={reports} sources={sources} commands={commands} onSelect={selectCommand} /> : null}
+      {view === "reports" || view === "sources" ? <ReportSurface reports={reports} sources={sources} commands={commands} onSelect={selectCommand} onOpenReport={openExactReport} reportLoadingRunId={reportLoadingRunId} showSources={view === "sources"} /> : null}
+      {view === "runs" ? <VerifiedRunsSurface reports={reports} sources={sources} commands={commands} onSelect={selectCommand} onOpenReport={openExactReport} reportLoadingRunId={reportLoadingRunId} /> : null}
       {view === "operations" ? <OperationsSurface overview={overview} commands={commands} onSelect={selectCommand} /> : null}
+
+      {(view === "reports" || view === "runs") && reportDocument ? <ExactReportViewer report={reportDocument} onClose={() => setReportDocument(null)} /> : null}
 
       {visibleReviewLanes.length ? (
         <ReviewQueue
@@ -711,7 +746,7 @@ function CommunicationSurface({ storyComms, commands, onSelect }: { storyComms: 
   );
 }
 
-function ReportSurface({ reports, sources, commands, onSelect, showSources }: { reports: UnknownRecord; sources: UnknownRecord; commands: OperatorCommand[]; onSelect: (command: OperatorCommand) => void; showSources: boolean }) {
+function ReportSurface({ reports, sources, commands, onSelect, onOpenReport, reportLoadingRunId, showSources }: { reports: UnknownRecord; sources: UnknownRecord; commands: OperatorCommand[]; onSelect: (command: OperatorCommand) => void; onOpenReport: (runId: string) => Promise<void>; reportLoadingRunId: string; showSources: boolean }) {
   const reportItems = firstList(reports, ["items", "reports", "run_reports"]);
   const latestSources = asRecord(sources.latest);
   const sourceItems = firstList(sources, ["items", "sources", "source_breakdown"]).length ? firstList(sources, ["items", "sources", "source_breakdown"]) : firstList(latestSources, ["sources", "source_breakdown"]);
@@ -721,21 +756,21 @@ function ReportSurface({ reports, sources, commands, onSelect, showSources }: { 
   return (
     <>
       <section className="operator-metrics"><article><span>Verified reports</span><strong>{number(reports.total ?? reports.count ?? reportItems.length)}</strong><small>Exact run scope</small></article><article><span>Latest run</span><strong className="metric-compact">{text(reports.latest_run_id ?? sources.run_id ?? latestSources.run_id, "Unavailable")}</strong><small>Immutable pointer</small></article><article><span>Sources</span><strong>{number(sources.total ?? sourceItems.length)}</strong><small>Explicit coverage</small></article><article><span>Failures</span><strong>{number(reports.failure_count ?? sources.failure_count)}</strong><small>Never hidden</small></article></section>
-      <section className="operator-panel"><div className="operator-panel-head"><div><span>{showSources ? "Source breakdown" : "Run-scoped briefs"}</span><h3>{showSources ? "What ran, skipped, failed, and advanced" : "Daily reports bound to exact evidence"}</h3></div><small>{showSources ? `${sourceItems.length} exact source rows` : `${returned} of ${total}${truncated ? " · bounded view" : ""}`}</small></div>{showSources ? <SourceRows items={sourceItems} /> : <ReportRows items={reportItems} />}</section>
+      <section className="operator-panel"><div className="operator-panel-head"><div><span>{showSources ? "Source breakdown" : "Run-scoped briefs"}</span><h3>{showSources ? "What ran, skipped, failed, and advanced" : "Daily reports bound to exact evidence"}</h3></div><small>{showSources ? `${sourceItems.length} exact source rows` : `${returned} of ${total}${truncated ? " · bounded view" : ""}`}</small></div>{showSources ? <SourceRows items={sourceItems} /> : <ReportRows items={reportItems} onOpen={onOpenReport} loadingRunId={reportLoadingRunId} />}</section>
       <CommandSection title="Report controls" commands={commands.filter((command) => command.id.includes("report") || command.id.includes("source"))} onSelect={onSelect} />
       <p className="operator-boundary-note">Convenience “latest” mirrors never become run evidence. Refresh is enabled only when a completed summary supplies the exact metrics, queue, and report pointers.</p>
     </>
   );
 }
 
-function VerifiedRunsSurface({ reports, sources, commands, onSelect }: { reports: UnknownRecord; sources: UnknownRecord; commands: OperatorCommand[]; onSelect: (command: OperatorCommand) => void }) {
+function VerifiedRunsSurface({ reports, sources, commands, onSelect, onOpenReport, reportLoadingRunId }: { reports: UnknownRecord; sources: UnknownRecord; commands: OperatorCommand[]; onSelect: (command: OperatorCommand) => void; onOpenReport: (runId: string) => Promise<void>; reportLoadingRunId: string }) {
   const reportItems = firstList(reports, ["items"]);
   const returned = number(reports.items_returned, reportItems.length);
   const total = number(reports.total, reportItems.length);
   return (
     <>
       <section className="operator-metrics"><article><span>Verified runs</span><strong>{total}</strong><small>Complete evidence chain</small></article><article><span>Latest run</span><strong className="metric-compact">{text(reports.latest_run_id, "Unavailable")}</strong><small>Run-scoped pointer</small></article><article><span>Latest sources</span><strong>{number(sources.total)}</strong><small>Explicit source rows</small></article><article><span>Latest failures</span><strong>{number(reports.failure_count ?? sources.failure_count)}</strong><small>Never hidden</small></article></section>
-      <section className="operator-panel"><div className="operator-panel-head"><div><span>Verified run ledger</span><h3>Nightly runs with exact bound artifacts</h3></div><small>{returned} of {total}{Boolean(reports.truncated) ? " · bounded view" : ""}</small></div><ReportRows items={reportItems} /></section>
+      <section className="operator-panel"><div className="operator-panel-head"><div><span>Verified run ledger</span><h3>Nightly runs with exact bound artifacts</h3></div><small>{returned} of {total}{Boolean(reports.truncated) ? " · bounded view" : ""}</small></div><ReportRows items={reportItems} onOpen={onOpenReport} loadingRunId={reportLoadingRunId} /></section>
       <CommandSection title="Verified run controls" commands={commands.filter((command) => command.id === "production.preflight" || command.id.includes("report"))} onSelect={onSelect} />
       <p className="operator-boundary-note">A row appears only after the nightly summary, manifest, source metrics, queue, and Outreach report pass the complete evidence chain. Mutable workspace snapshots are never substituted for a run artifact.</p>
     </>
@@ -752,14 +787,32 @@ function SourceRows({ items }: { items: UnknownRecord[] }) {
   })}</div>;
 }
 
-function ReportRows({ items }: { items: UnknownRecord[] }) {
+function ReportRows({ items, onOpen, loadingRunId }: { items: UnknownRecord[]; onOpen: (runId: string) => Promise<void>; loadingRunId: string }) {
   if (!items.length) return <p className="operator-empty-row">No verified daily report is eligible yet.</p>;
   return <div className="operator-row-list">{items.map((item, index) => {
     const workspace = asRecord(item.workspace_counts);
     const workspaceDetail = Object.entries(workspace).slice(0, 3).map(([label, value]) => `${label.replaceAll("_", " ")} ${number(value)}`).join(" · ");
     const detail = [`${number(item.source_count)} sources`, `${number(item.failure_count)} failures`, `${number(item.pending_review_count)} pending review`, workspaceDetail].filter(Boolean).join(" · ");
-    return <article key={text(item.run_id, `${index}`)}><span>{text(item.status, "verified")}</span><div><strong>{text(item.run_id, "Run ID unavailable")}</strong><p>{detail}</p></div><small>{text(item.completed_at ?? item.started_at, "—")}</small></article>;
+    const runId = text(item.run_id, "");
+    return <article key={runId || `${index}`}><span>{text(item.status, "verified")}</span><div><strong>{runId || "Run ID unavailable"}</strong><p>{detail}</p></div><div className="operator-report-row-actions"><small>{text(item.completed_at ?? item.started_at, "—")}</small><button type="button" disabled={!runId || Boolean(loadingRunId)} onClick={() => void onOpen(runId)}>{loadingRunId === runId ? "Loading…" : "View full report"}</button></div></article>;
   })}</div>;
+}
+
+function ExactReportViewer({ report, onClose }: { report: OperatorReportDocument; onClose: () => void }) {
+  const policy = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; form-action 'none'; base-uri 'none'">`;
+  const sandboxedHtml = /<head(?:\s[^>]*)?>/i.test(report.html)
+    ? report.html.replace(/<head(\s[^>]*)?>/i, (match) => `${match}${policy}`)
+    : `<!doctype html><html><head>${policy}</head><body>${report.html}</body></html>`;
+  return (
+    <section className="operator-panel operator-report-viewer" aria-labelledby="exact-report-title">
+      <header>
+        <div><span>Authenticated exact artifact</span><h3 id="exact-report-title">Daily report · {report.run_id}</h3><small>{Math.ceil(report.size_bytes / 1024)} KB · SHA {report.sha256.slice(0, 12)}…</small></div>
+        <button type="button" onClick={onClose} aria-label="Close full report">Close</button>
+      </header>
+      <iframe title={`Exact daily report ${report.run_id}`} sandbox="" referrerPolicy="no-referrer" srcDoc={sandboxedHtml} />
+      <p>This viewer is sandboxed with scripts, forms, top-level navigation, and remote subresources disabled. The document remains served only by your authenticated local companion.</p>
+    </section>
+  );
 }
 
 function ReviewQueue({

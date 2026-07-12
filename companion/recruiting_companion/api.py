@@ -296,6 +296,20 @@ class CompanionHandler(BaseHTTPRequestHandler):
                     origin,
                 )
                 return
+            report_html_match = re.fullmatch(
+                r"/operator/reports/(\d{8}-\d{6})/html", route
+            )
+            if method == "GET" and report_html_match:
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "report": operator.exact_report_html(
+                            report_html_match.group(1)
+                        )
+                    },
+                    origin,
+                )
+                return
             if method == "GET" and route == "/operator/review-targets":
                 self._send_json(
                     HTTPStatus.OK,
@@ -717,6 +731,10 @@ class CompanionHandler(BaseHTTPRequestHandler):
         if method == "POST" and re.fullmatch(r"/outreach/[^/]+/approve", route):
             allowed = True
         if method == "GET" and re.fullmatch(r"/operator/jobs/[^/]+", route):
+            allowed = True
+        if method == "GET" and re.fullmatch(
+            r"/operator/reports/\d{8}-\d{6}/html", route
+        ):
             allowed = True
         if method == "GET" and re.fullmatch(
             r"/operator/review-targets/[^/]+/detail", route

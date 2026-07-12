@@ -24,6 +24,7 @@ from recruiting_companion.operator_backend import OperatorBackend
 from recruiting_companion.service import (
     CompanionService,
     ConflictError,
+    NotFoundError,
     ValidationError,
 )
 
@@ -470,6 +471,51 @@ class APITestCase(unittest.TestCase):
         connection.close()
         return response.status, payload, response_headers
 
+    def test_paired_web_client_can_fetch_one_exact_report_without_caching(self) -> None:
+        run_id = "20260711-120000"
+        path = f"/api/v1/operator/reports/{run_id}/html"
+        status, unauthorized, _ = self.request("GET", path)
+        self.assertEqual(status, 401)
+        self.assertEqual(unauthorized["error"]["code"], "unauthorized")
+
+        status, paired, _ = self.request(
+            "POST",
+            "/api/v1/pair",
+            body={
+                "pairing_token": self.bootstrap.pairing_token,
+                "client_type": "web",
+            },
+        )
+        self.assertEqual(status, 200)
+        web_bearer = str(paired["bearer_token"])
+        exact_report = {
+            "run_id": run_id,
+            "html": "<!doctype html><title>Exact report</title>",
+            "sha256": "a" * 64,
+            "size_bytes": 48,
+            "content_type": "text/html; charset=utf-8",
+        }
+        with patch.object(
+            OperatorBackend,
+            "exact_report_html",
+            return_value=exact_report,
+        ) as viewer:
+            status, payload, headers = self.request(
+                "GET",
+                path,
+                bearer=web_bearer,
+                origin="https://axe-pat.github.io",
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"report": exact_report})
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(
+            headers["Access-Control-Allow-Origin"],
+            "https://axe-pat.github.io",
+        )
+        viewer.assert_called_once_with(run_id)
+
     def test_pair_auth_rotation_cors_and_host_protection(self) -> None:
         status, health, headers = self.request(
             "GET",
@@ -559,7 +605,7 @@ class APITestCase(unittest.TestCase):
             {"bearer_token", "token_type", "client_type", "expires_in"},
         )
         self.assertEqual(paired["client_type"], "web")
-        self.assertEqual(paired["expires_in"], 1800)
+        self.assertEqual(paired["expires_in"], TokenStore.WEB_SESSION_SECONDS)
         web_bearer = str(paired["bearer_token"])
         self.assertTrue(web_bearer.startswith("re_web_"))
         self.assertNotEqual(web_bearer, local_bearer)
@@ -589,7 +635,7 @@ class APITestCase(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(error["error"]["code"], "insufficient_scope")
 
-        self.now[0] += 1801
+        self.now[0] += TokenStore.WEB_SESSION_SECONDS + 1
         status, _, _ = self.request(
             "GET", "/api/v1/dashboard", bearer=web_bearer
         )
@@ -957,6 +1003,103 @@ class APITestCase(unittest.TestCase):
 
 
 class OperatorBackendTestCase(unittest.TestCase):
+    def test_exact_report_html_is_verified_bounded_and_daily_html_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outreach = root / "outreach"
+            report_root = outreach / "workspace" / "reports" / "daily_html"
+            report_root.mkdir(parents=True)
+            settings = Settings(
+                data_dir=root / "data",
+                user_id="report-viewer-user",
+                outreach_root=outreach,
+            )
+            settings.prepare()
+            backend = OperatorBackend(settings)
+            run_id = "20260711-120000"
+            filename = f"{run_id}-daily-run-report.html"
+            report_path = report_root / filename
+            content = b"<!doctype html><title>Verified exact report</title>"
+            report_path.write_bytes(content)
+            evidence = {
+                "state": "valid",
+                "path": report_path.relative_to(outreach).as_posix(),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "size_bytes": len(content),
+            }
+            projection = {
+                "run_id": run_id,
+                "evidence": {"outreach_html": evidence},
+            }
+
+            with patch.object(
+                backend.adapter,
+                "verified_run_projections",
+                return_value=[projection],
+            ) as projections:
+                report = backend.exact_report_html(run_id)
+            self.assertEqual(report["run_id"], run_id)
+            self.assertEqual(report["html"], content.decode("utf-8"))
+            self.assertEqual(report["sha256"], evidence["sha256"])
+            self.assertEqual(report["size_bytes"], len(content))
+            self.assertEqual(report["content_type"], "text/html; charset=utf-8")
+            projections.assert_called_once_with(limit=50)
+
+            with patch.object(
+                backend.adapter,
+                "verified_run_projections",
+                return_value=[projection],
+            ) as latest_projection:
+                self.assertEqual(
+                    backend._open_target("open.latest_report"),
+                    report_path.resolve(strict=True),
+                )
+            latest_projection.assert_called_once_with(limit=1)
+
+            with patch.object(
+                backend.adapter,
+                "verified_run_projections",
+                return_value=[projection],
+            ):
+                with self.assertRaises(NotFoundError):
+                    backend.exact_report_html("20260711-120001")
+
+                report_path.write_bytes(content + b" changed")
+                with self.assertRaisesRegex(
+                    ConflictError, "changed after verification"
+                ):
+                    backend.exact_report_html(run_id)
+                report_path.write_bytes(content)
+
+                evidence["path"] = f"workspace/reports/{filename}"
+                with self.assertRaisesRegex(
+                    ValidationError, "unavailable or unsafe"
+                ):
+                    backend.exact_report_html(run_id)
+
+                evidence["path"] = f"workspace/reports/daily_html/latest/{filename}"
+                with self.assertRaisesRegex(
+                    ValidationError, "unavailable or unsafe"
+                ):
+                    backend.exact_report_html(run_id)
+
+                evidence["path"] = report_path.relative_to(outreach).as_posix()
+                evidence["size_bytes"] = 5 * 1024 * 1024 + 1
+                with self.assertRaisesRegex(
+                    ValidationError, "exceeds the viewer limit"
+                ):
+                    backend.exact_report_html(run_id)
+                evidence["size_bytes"] = len(content)
+
+                outside = root / "outside.html"
+                outside.write_bytes(content)
+                report_path.unlink()
+                report_path.symlink_to(outside)
+                with self.assertRaisesRegex(
+                    ValidationError, "unavailable or unsafe"
+                ):
+                    backend.exact_report_html(run_id)
+
     def test_strict_audited_preflight_and_local_open_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2507,6 +2650,50 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
 
 
 class ExistingAdapterTestCase(unittest.TestCase):
+    def test_pointer_containment_accepts_case_variant_root_by_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "ConfiguredRoot"
+            artifact = root / "reports" / "run-report.json"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text("{}", encoding="utf-8")
+
+            case_variant_root = base / "configuredroot"
+            if not case_variant_root.is_dir():
+                self.skipTest("test requires a case-insensitive filesystem")
+
+            resolved = ExistingEngineAdapter._resolve_pointer(
+                root,
+                str(case_variant_root / "reports" / "run-report.json"),
+                "report",
+            )
+
+            self.assertEqual(resolved, artifact.resolve(strict=True))
+            self.assertEqual(
+                ExistingEngineAdapter._file_evidence(resolved, root)["path"],
+                "reports/run-report.json",
+            )
+
+    def test_pointer_containment_rejects_traversal_and_symlink_escapes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "configured-root"
+            root.mkdir()
+            outside = base / "outside.json"
+            outside.write_text("{}", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "escapes its configured root"):
+                ExistingEngineAdapter._resolve_pointer(
+                    root,
+                    str(root / ".." / outside.name),
+                    "report",
+                )
+
+            symlink = root / "linked-report.json"
+            symlink.symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, "escapes its configured root"):
+                ExistingEngineAdapter._resolve_pointer(root, str(symlink), "report")
+
     def test_adapter_fails_closed_then_accepts_exact_attested_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

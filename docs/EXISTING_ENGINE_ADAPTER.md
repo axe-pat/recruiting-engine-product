@@ -301,8 +301,8 @@ Portable mode is a different product state:
   are inherited;
 - the scheduler and attestation capabilities are reported as unavailable unless
   portable-native equivalents actually exist;
-- fictional preview data remains labeled `fictional-demo` and is never combined
-  with local-private metrics.
+- fictional preview fixtures remain labeled `fictional-demo`, are never combined
+  with local-private metrics, and are not rendered on an unpaired operational route.
 
 Both modes may implement the same normalized API. They must not claim the same
 capabilities or evidence.

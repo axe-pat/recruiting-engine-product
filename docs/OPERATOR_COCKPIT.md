@@ -17,7 +17,7 @@ actions from a fixed registry.
 | Application history | ResumeGenerator `discovery/jobs.xlsx` (`Jobs` live, `Archive` history) | Status/source/role aggregates without serving the workbook or private answer bank |
 | Stories | Career Workbench, story sources, and story bank | Curated filenames/categories and inventory counts; the filename-classified story count may include drafts and is not presented as canonical |
 | Communications | Exact nightly manifest plus its bound invite, follow-up, and email draft artifacts | Minimized review counts in overview; exact recipient, context, subject, and draft only from the authenticated selected-target detail endpoint |
-| Reports | One completed nightly summary and the exact manifest, source metrics, action queue, and Outreach report it names | Run-scoped reports and explicit source status, including zero, skipped, timed-out, and failed |
+| Reports | One completed nightly summary and the exact manifest, source metrics, action queue, and Outreach report it names | Run-scoped status plus the authenticated full HTML artifact in a scriptless, remote-subresource-disabled iframe; zero, skipped, timed-out, and failed sources stay explicit |
 | Operations | Production release attestation, scheduler/pipeline/workbook/queue locks, companion mutation lock, and local review ledger | Capability availability, review/approval state, fixed confirmations, and audit trails for reviews and jobs |
 
 Existing mode resolves the persisted mode preference before it requests a read
@@ -97,6 +97,11 @@ leaves approval unconsumed. After a successful preflight, approval is consumed,
 the companion mutation lock is released, and only then is `nightly_prompt.py`
 spawned so its scheduler/pipeline lock order cannot deadlock.
 
+The top-bar **Run E2E** control opens this exact nightly target directly; it does
+not bypass the review ledger. The user still stages the target, records review,
+approves it, and enters `RUN_REVIEWED_NIGHTLY` before the fixed no-delivery
+process can start. **Refresh** remains a separate read-only control.
+
 The general operator overview never contains raw profile URLs, email addresses,
 recipient names, subjects, message bodies, or thread context. Those fields are
 returned only for one selected target through
@@ -171,6 +176,13 @@ the run root. The source metrics, decision queue, daily report, and HTML report
 must all be the exact artifacts bound to that run before the UI labels them
 verified.
 
+`GET /api/v1/operator/reports/<run-id>/html` is web-session authenticated and
+accepts only a fully verified exact run. It resolves the expected run-named file
+under `Outreach/workspace/reports/daily_html`, rejects aliases, symlinks,
+traversal, stale size/hash evidence, and files over 5 MiB, and returns no-store
+JSON. The browser injects a deny-by-default document CSP and renders the report
+without scripts, forms, navigation, or network access.
+
 Bounded projections display their returned and total row counts and label
 truncation. The local workbook or workbench remains the route to the complete
 dataset.
@@ -186,6 +198,6 @@ operator service defaults to that mode; an existing persisted preference still
 wins.
 
 Pairing tokens are one-time exchanges. A successful tab stores only the returned
-short-lived web session in `sessionStorage`; the Settings screen then shows
+12-hour web session in `sessionStorage`; the Settings screen then shows
 **Connected** and does not attempt to exchange a pasted `re_pair_` token again.
 Disconnect the tab before generating and using another pairing token.

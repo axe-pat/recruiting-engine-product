@@ -763,7 +763,28 @@ class ExistingEngineAdapter:
         resolved_root = root.resolve(strict=True)
         resolved = candidate.resolve(strict=True)
         if not resolved.is_relative_to(resolved_root):
-            raise ValueError(f"{label} pointer escapes its configured root")
+            # Path.relative_to() compares path text. On the default macOS
+            # case-insensitive filesystem, two spellings such as
+            # "Claude Projects" and "Claude projects" can identify the same
+            # directory while still failing that textual comparison. Prove
+            # containment using filesystem identity, then rebuild the path
+            # with the configured root's spelling so downstream relative-path
+            # evidence remains stable. A traversal or symlink escape has no
+            # ancestor with the root directory's identity and still fails.
+            matching_ancestor: Path | None = None
+            for ancestor in (resolved, *resolved.parents):
+                try:
+                    if ancestor.samefile(resolved_root):
+                        matching_ancestor = ancestor
+                        break
+                except OSError:
+                    continue
+            if matching_ancestor is None:
+                raise ValueError(f"{label} pointer escapes its configured root")
+            suffix = resolved.parts[len(matching_ancestor.parts) :]
+            resolved = resolved_root.joinpath(*suffix).resolve(strict=True)
+            if not resolved.is_relative_to(resolved_root):
+                raise ValueError(f"{label} pointer escapes its configured root")
         if resolved.name.lower().startswith("latest"):
             raise ValueError(f"{label} cannot use a latest alias")
         if any(part.lower() in {"latest", "current"} for part in resolved.parts):

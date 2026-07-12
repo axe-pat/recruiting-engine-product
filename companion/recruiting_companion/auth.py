@@ -48,7 +48,10 @@ class PairingExchange:
 class TokenStore:
     """Hash-backed bearer auth with a one-time local pairing credential."""
 
-    WEB_SESSION_SECONDS = 30 * 60
+    # A real nightly cycle can run for several hours. Keep the tab-scoped web
+    # session alive for a full operating day so the authenticated cockpit can
+    # poll through completion without falling back to a disconnected state.
+    WEB_SESSION_SECONDS = 12 * 60 * 60
     MAX_WEB_SESSIONS = 64
 
     def __init__(

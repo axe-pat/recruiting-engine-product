@@ -19,7 +19,7 @@ Defaults:
 - data: `~/.recruiting-engine-companion/users/default/`;
 - API: `http://127.0.0.1:8765/api/v1`.
 
-The first start creates `pairing-token.txt` and `bearer-token.txt` with mode `0600`. Every `re_pair_...` value is one-time. Default/extension pairing returns the existing shared `re_local_...` bearer without invalidating an already paired extension. Hosted-web pairing uses `client_type: "web"` and returns a separate `re_web_...` session that expires after 30 minutes. Only its hash and expiry are persisted; the long-lived local bearer is neither returned nor rotated by web pairing.
+The first start creates `pairing-token.txt` and `bearer-token.txt` with mode `0600`. Every `re_pair_...` value is one-time. Default/extension pairing returns the existing shared `re_local_...` bearer without invalidating an already paired extension. Hosted-web pairing uses `client_type: "web"` and returns a separate `re_web_...` session that expires after 12 hours, long enough to follow one full nightly cycle. Only its hash and expiry are persisted; the long-lived local bearer is neither returned nor rotated by web pairing.
 
 `POST /api/v1/auth/rotate` is the explicit global revocation operation. Only the long-lived local bearer may call it. Rotation returns a replacement local bearer and invalidates the previous local bearer plus every outstanding web session.
 
@@ -233,7 +233,7 @@ python3 -m compileall -q companion/recruiting_companion companion/tests
 ## Current limitations
 
 - One companion process serves one configured local user; this is not a hosted multi-tenant service.
-- The long-lived bearer is shared across paired extension/local clients; named device tokens are not implemented. Hosted web sessions are hash-only and expire after 30 minutes.
+- The long-lived bearer is shared across paired extension/local clients; named device tokens are not implemented. Hosted web sessions are hash-only, tab-scoped in the UI, and expire after 12 hours.
 - Documents can be uploaded and cataloged, but this release does not parse resume content or run models.
 - Portable runs use imported scores and explicit states. They do not calculate semantic fit.
 - The existing-engine bridge exposes aggregate/minimized projections plus only the fixed, confirmed actions listed above; it deliberately fails closed on legacy artifacts without the exact attested manifest contract.

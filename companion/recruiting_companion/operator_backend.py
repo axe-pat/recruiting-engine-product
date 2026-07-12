@@ -30,6 +30,7 @@ _XLSX_REL_NS = (
 )
 _MAX_XLSX_BYTES = 64 * 1024 * 1024
 _MAX_XLSX_EXPANDED_BYTES = 256 * 1024 * 1024
+_MAX_REPORT_HTML_BYTES = 5 * 1024 * 1024
 _OPERATOR_JOB_LIMIT = 100
 _QUEUE_ITEM_LIMIT = 100
 _ACCOUNT_ACTION_LIMIT = 50
@@ -741,6 +742,58 @@ class OperatorBackend:
             "assets": assets,
             "recent_jobs": self.list_jobs(limit=10),
             "review_queue": self.review_queue(),
+        }
+
+    def exact_report_html(self, run_id: str) -> dict[str, Any]:
+        """Return one immutable, verified run report for the paired web client."""
+        if not re.fullmatch(r"\d{8}-\d{6}", run_id):
+            raise NotFoundError("verified report not found")
+        if not self.settings.outreach_root:
+            raise ValidationError("Outreach root is not configured")
+
+        matches = [
+            projection
+            for projection in self.adapter.verified_run_projections(limit=50)
+            if projection.get("run_id") == run_id
+        ]
+        if not matches:
+            raise NotFoundError("verified report not found")
+        if len(matches) != 1:
+            raise ValidationError("verified report identity is ambiguous")
+
+        try:
+            report_path, evidence = self._verified_report_html_path(
+                matches[0], run_id
+            )
+        except (OSError, ValueError) as error:
+            raise ValidationError(
+                "verified HTML report is unavailable or unsafe"
+            ) from error
+        expected_sha256 = str(evidence["sha256"])
+        expected_size = int(evidence["size_bytes"])
+        if expected_size > _MAX_REPORT_HTML_BYTES:
+            raise ValidationError("verified HTML report exceeds the viewer limit")
+
+        try:
+            content = _read_bounded_bytes(
+                report_path,
+                limit=_MAX_REPORT_HTML_BYTES,
+            )
+            html = content.decode("utf-8")
+        except (OSError, UnicodeError, ValueError) as error:
+            raise ValidationError(
+                "verified HTML report is unavailable or unsafe"
+            ) from error
+
+        actual_sha256 = hashlib.sha256(content).hexdigest()
+        if len(content) != expected_size or actual_sha256 != expected_sha256:
+            raise ConflictError("verified HTML report changed after verification")
+        return {
+            "run_id": run_id,
+            "html": html,
+            "sha256": actual_sha256,
+            "size_bytes": len(content),
+            "content_type": "text/html; charset=utf-8",
         }
 
     def assets(self) -> dict[str, Any]:
@@ -4631,18 +4684,15 @@ class OperatorBackend:
         if command_id == "open.latest_report":
             if not self.settings.outreach_root:
                 raise ValueError("outreach root unavailable")
-            status = self.adapter.status()
-            latest = status.get("latest_verified_run")
-            if not isinstance(latest, dict):
+            projections = self.adapter.verified_run_projections(limit=1)
+            if not projections:
                 raise ValueError("verified report unavailable")
-            html = latest.get("evidence", {}).get("outreach_html")
-            if not isinstance(html, dict) or not html.get("path"):
-                raise ValueError("verified HTML report unavailable")
-            return _strict_allowlisted_path(
-                self.settings.outreach_root,
-                self.settings.outreach_root / str(html["path"]),
-                expect="file",
+            latest = projections[-1]
+            report_path, _ = self._verified_report_html_path(
+                latest,
+                str(latest.get("run_id") or ""),
             )
+            return report_path
         if command_id == "open.story_workbench":
             if not self.settings.resumegen_root:
                 raise ValueError("resume root unavailable")
@@ -4681,6 +4731,60 @@ class OperatorBackend:
             row = self._current_queue_job(job_id)
             return self._queue_job_folder(row)
         raise ValueError("open command is not allowlisted")
+
+    def _verified_report_html_path(
+        self,
+        projection: dict[str, Any],
+        run_id: str,
+    ) -> tuple[Path, dict[str, Any]]:
+        if not re.fullmatch(r"\d{8}-\d{6}", run_id):
+            raise ValueError("verified report run id is invalid")
+        if projection.get("run_id") != run_id:
+            raise ValueError("verified report run id does not match")
+        if not self.settings.outreach_root:
+            raise ValueError("outreach root unavailable")
+
+        evidence = projection.get("evidence", {}).get("outreach_html")
+        if not isinstance(evidence, dict) or evidence.get("state") != "valid":
+            raise ValueError("verified HTML report evidence is unavailable")
+        relative_path = evidence.get("path")
+        expected_sha256 = evidence.get("sha256")
+        expected_size = evidence.get("size_bytes")
+        if (
+            not isinstance(relative_path, str)
+            or not relative_path
+            or not isinstance(expected_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+            or not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+            or expected_size < 0
+        ):
+            raise ValueError("verified HTML report evidence is invalid")
+
+        relative = Path(relative_path)
+        if (
+            relative.is_absolute()
+            or relative.name != f"{run_id}-daily-run-report.html"
+            or any(part.lower() in {"latest", "current"} for part in relative.parts)
+        ):
+            raise ValueError("verified HTML report pointer is not exact")
+
+        outreach_root = _strict_allowlisted_path(
+            self.settings.outreach_root,
+            self.settings.outreach_root,
+            expect="directory",
+        )
+        report_root = _strict_allowlisted_path(
+            outreach_root,
+            outreach_root / "workspace" / "reports" / "daily_html",
+            expect="directory",
+        )
+        report_path = _strict_allowlisted_path(
+            report_root,
+            outreach_root / relative,
+            expect="file",
+        )
+        return report_path, evidence
 
     @staticmethod
     def _all_locks_free(locks: dict[str, Any]) -> bool:

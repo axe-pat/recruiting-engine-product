@@ -183,3 +183,11 @@ export type OperatorReviewResult = {
   operator_review?: OperatorReviewPrivateDetail;
   review_target?: OperatorReviewTargetDetail;
 };
+
+export type OperatorReportDocument = {
+  run_id: string;
+  html: string;
+  sha256: string;
+  size_bytes: number;
+  content_type: "text/html; charset=utf-8" | string;
+};

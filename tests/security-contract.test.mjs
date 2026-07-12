@@ -30,6 +30,8 @@ test("hosted pairing is explicit, short-lived, and tab-scoped", () => {
 
 test("preview does not probe loopback before user intent", () => {
   assert.match(appFrame, /if \(!nextConfig\.token\)[\s\S]{0,160}setConnection\("preview"\)/);
+  assert.match(appFrame, /view !== "settings" && connection !== "connected"/);
+  assert.match(appFrame, /fictional preview records are no longer rendered on operational routes/);
 });
 
 test("hosted dashboard consumes minimized presentation DTOs", () => {
@@ -53,6 +55,24 @@ test("operator controls call only the fixed local job registry", () => {
   assert.match(operatorWorkspace, /There is no arbitrary shell/);
   assert.match(operatorWorkspace, /Only this named capability can run/);
   assert.doesNotMatch(operatorWorkspace, /exec\(|spawn\(|child_process|command_line|argv/);
+});
+
+test("the global E2E control opens the reviewed no-delivery nightly target", () => {
+  assert.match(appFrame, /window\.location\.assign\("\/app\/runs\?start=nightly"\)/);
+  assert.match(appFrame, /"Run E2E"/);
+  assert.match(appFrame, /setAutoReviewCommandId\("nightly\.run"\)/);
+  assert.match(operatorWorkspace, /candidate\.command_id === autoReviewCommandId/);
+  assert.match(operatorWorkspace, /void selectReviewTarget\(target\)/);
+  assert.match(operatorWorkspace, /review_id: next\.id, target_id: next\.target_id/);
+});
+
+test("exact reports load only through the paired companion and render sandboxed", () => {
+  assert.match(appFrame, /\/api\/v1\/operator\/reports\/\$\{encodeURIComponent\(runId\)\}\/html/);
+  assert.match(operatorWorkspace, /function ExactReportViewer/);
+  assert.match(operatorWorkspace, /<iframe[\s\S]{0,220}sandbox=""[\s\S]{0,220}srcDoc=\{sandboxedHtml\}/);
+  assert.match(operatorWorkspace, /default-src 'none'/);
+  assert.match(operatorWorkspace, /scripts, forms, top-level navigation, and remote subresources disabled/);
+  assert.doesNotMatch(operatorWorkspace, /dangerouslySetInnerHTML/);
 });
 
 test("consequential actions use a dedicated exact-target review surface", () => {

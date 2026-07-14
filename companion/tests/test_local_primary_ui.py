@@ -385,6 +385,66 @@ class LocalPrimaryUITestCase(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertNotIn("bearer_token", body.decode("utf-8"))
 
+    def test_cookie_auth_can_stage_and_queue_reviewed_operator_actions(self) -> None:
+        # Regression: cookie scope is "local_ui". Review staging and job submit
+        # must accept that scope; otherwise Run E2E dies at "Stage exact content".
+        cookie, _, _ = self.activate(self.tokens.issue_local_activation_ticket())
+        local_headers = self.local_headers(cookie)
+        target_id = "target_" + ("a" * 24)
+
+        status, body, _ = self.request(
+            "POST",
+            "/api/v1/operator/reviews",
+            body={
+                "command_id": "nightly.run",
+                "target_id": target_id,
+                "reviewed_text": "",
+                "reviewed_subject": "",
+            },
+            headers=local_headers,
+        )
+        payload = self.json_body(body)
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+        self.assertNotEqual(
+            error.get("message"),
+            "requested_scope must be local or web",
+            msg=payload,
+        )
+        self.assertNotIn(
+            "requested_scope must be local, local_ui, or web",
+            str(error.get("message") or ""),
+            msg=payload,
+        )
+        # Fake target cannot resolve without an installed engine; scope must still pass.
+        self.assertEqual(status, 404, msg=payload)
+        self.assertEqual(error.get("code"), "not_found")
+
+        status, body, _ = self.request(
+            "POST",
+            "/api/v1/operator/jobs",
+            body={
+                "command_id": "production.preflight",
+                "confirmation": "RUN_PRODUCTION_PREFLIGHT",
+            },
+            headers=local_headers,
+        )
+        payload = self.json_body(body)
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+        self.assertNotEqual(
+            error.get("message"),
+            "requested_scope must be local or web",
+            msg=payload,
+        )
+        self.assertNotIn(
+            "requested_scope must be local, local_ui, or web",
+            str(error.get("message") or ""),
+            msg=payload,
+        )
+        # Without resume/attestation roots this remains blocked or unavailable — not a scope 422.
+        self.assertIn(status, {201, 409, 422}, msg=payload)
+        if status == 422:
+            self.assertNotIn("requested_scope", str(error.get("message") or ""))
+
     def test_tickets_and_bearers_are_absent_from_access_logs_and_json(self) -> None:
         ticket = self.tokens.issue_local_activation_ticket()
         capture = io.StringIO()

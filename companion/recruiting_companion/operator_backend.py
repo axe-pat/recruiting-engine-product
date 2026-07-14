@@ -128,6 +128,8 @@ _INVITE_TOTAL_FIELDS = {
 
 _SAFE_REVIEW_ID = re.compile(r"^review_[a-f0-9]{32}$")
 _SAFE_TARGET_ID = re.compile(r"^target_[a-f0-9]{24}$")
+# Bearer tokens use "local"/"web"; the primary loopback cookie uses "local_ui".
+_ALLOWED_REQUEST_SCOPES = frozenset({"local", "local_ui", "web"})
 _REVIEW_CONFIRMATION = "REVIEW_EXACT_TARGET"
 _APPROVAL_CONFIRMATION = "APPROVE_EXACT_TARGET"
 _REVOCATION_CONFIRMATION = "REVOKE_EXACT_TARGET"
@@ -1232,8 +1234,8 @@ class OperatorBackend:
         confirmation: str,
         requested_scope: str,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        if requested_scope not in {"local", "web"}:
-            raise ValidationError("requested_scope must be local or web")
+        if requested_scope not in _ALLOWED_REQUEST_SCOPES:
+            raise ValidationError("requested_scope must be local, local_ui, or web")
         if confirmation != _CONTENT_UPDATE_CONFIRMATION:
             raise ValidationError("confirmation phrase does not match content update")
         self._expire_reviews()
@@ -1323,8 +1325,8 @@ class OperatorBackend:
     ) -> dict[str, Any]:
         if command_id not in _REVIEW_GATED_COMMANDS:
             raise ValidationError("command_id is not a review-gated capability")
-        if requested_scope not in {"local", "web"}:
-            raise ValidationError("requested_scope must be local or web")
+        if requested_scope not in _ALLOWED_REQUEST_SCOPES:
+            raise ValidationError("requested_scope must be local, local_ui, or web")
         if not _SAFE_TARGET_ID.fullmatch(target_id):
             raise ValidationError("target_id is not a projected operator target")
         self._expire_reviews()
@@ -1447,8 +1449,8 @@ class OperatorBackend:
         confirmation: str,
         requested_scope: str,
     ) -> dict[str, Any]:
-        if requested_scope not in {"local", "web"}:
-            raise ValidationError("requested_scope must be local or web")
+        if requested_scope not in _ALLOWED_REQUEST_SCOPES:
+            raise ValidationError("requested_scope must be local, local_ui, or web")
         transitions = {
             "review": ({"pending"}, "reviewed", _REVIEW_CONFIRMATION, "reviewed_at"),
             "approve": ({"reviewed"}, "approved", _APPROVAL_CONFIRMATION, "approved_at"),
@@ -2542,8 +2544,8 @@ class OperatorBackend:
         expected_confirmation = str(definition["confirmation"])
         if expected_confirmation and confirmation != expected_confirmation:
             raise ValidationError("confirmation phrase does not match the command")
-        if requested_scope not in {"local", "web"}:
-            raise ValidationError("requested_scope must be local or web")
+        if requested_scope not in _ALLOWED_REQUEST_SCOPES:
+            raise ValidationError("requested_scope must be local, local_ui, or web")
         safe_parameters = self._validate_parameters(command_id, parameters)
         if command_id in _REVIEW_GATED_COMMANDS:
             self._approved_review(command_id, safe_parameters)

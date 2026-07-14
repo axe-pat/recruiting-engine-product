@@ -16,8 +16,56 @@ case "${RECRUITING_ENGINE_HOST}" in
 esac
 base_url="http://${url_host}:${RECRUITING_ENGINE_PORT}"
 
-if ! /usr/bin/curl --fail --silent --show-error --max-time 3 \
-  "${base_url}/api/v1/health" >/dev/null 2>&1; then
+companion_is_healthy() {
+  /usr/bin/curl --fail --silent --show-error --max-time 3 \
+    "${base_url}/api/v1/health" >/dev/null 2>&1
+}
+
+recover_managed_launch_agent() {
+  [ "$(/usr/bin/uname -s)" = "Darwin" ] || return 1
+
+  local label="${RECRUITING_ENGINE_OPERATOR_LAUNCH_LABEL}"
+  local domain="gui/$(/usr/bin/id -u)"
+  local service="${domain}/${label}"
+  local plist_path="${HOME}/Library/LaunchAgents/${label}.plist"
+  local managed_by="Recruiting Engine Product operator companion installer"
+  local existing_manager=""
+  local existing_label=""
+  local attempt=0
+
+  [ -f "${plist_path}" ] || return 1
+  existing_manager="$(
+    /usr/bin/plutil -extract ManagedBy raw -o - "${plist_path}" 2>/dev/null || true
+  )"
+  existing_label="$(
+    /usr/bin/plutil -extract Label raw -o - "${plist_path}" 2>/dev/null || true
+  )"
+  if [ "${existing_manager}" != "${managed_by}" ] \
+    || [ "${existing_label}" != "${label}" ]; then
+    return 1
+  fi
+
+  # A normal login starts the managed service through RunAtLoad. This recovery
+  # covers a manually disabled, unloaded, or cleanly exited job without
+  # replacing the plist, rotating auth, or killing an unhealthy live process.
+  /bin/launchctl enable "${service}" >/dev/null 2>&1 || return 1
+  if ! /bin/launchctl print "${service}" >/dev/null 2>&1; then
+    if ! /bin/launchctl bootstrap "${domain}" "${plist_path}" >/dev/null 2>&1 \
+      && ! /bin/launchctl print "${service}" >/dev/null 2>&1; then
+      return 1
+    fi
+  fi
+  /bin/launchctl kickstart "${service}" >/dev/null 2>&1 || return 1
+
+  while [ "${attempt}" -lt 20 ]; do
+    companion_is_healthy && return 0
+    /bin/sleep 0.25
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+if ! companion_is_healthy && ! recover_managed_launch_agent; then
   operator_die "the local companion is not responding at ${base_url}"
   exit 1
 fi

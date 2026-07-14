@@ -77,6 +77,17 @@ test("server-renders a truthful connection gate before operational data", async 
   assert.doesNotMatch(html, /auto-send/i);
 });
 
+test("server-renders a credential-free permanent-local fallback on hosted settings", async () => {
+  const response = await render("/app/settings");
+  assert.equal(response.status, 200);
+
+  const html = await response.text();
+  assert.match(html, /Open permanent local cockpit/);
+  assert.match(html, /href="http:\/\/127\.0\.0\.1:8765\/app\/"/);
+  assert.match(html, /Optional · pair only this hosted tab for 12 hours/);
+  assert.doesNotMatch(html, /re_(?:web|local|pair|ui|activate)_[A-Za-z0-9_-]+/);
+});
+
 test("server-renders the private operator cockpit routes without private data", async () => {
   for (const path of ["/app/accounts", "/app/plan", "/app/stories", "/app/operations"]) {
     const response = await render(path);

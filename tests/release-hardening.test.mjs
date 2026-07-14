@@ -14,6 +14,10 @@ const installer = await readFile(
   new URL("../scripts/install-operator-companion-launch-agent.sh", import.meta.url),
   "utf8",
 );
+const cockpitLauncher = await readFile(
+  new URL("../scripts/open-operator-cockpit.sh", import.meta.url),
+  "utf8",
+);
 const restartGuard = await readFile(
   new URL("../scripts/check-operator-restart-safety.py", import.meta.url),
   "utf8",
@@ -83,6 +87,18 @@ test("installer holds the shared restart interlock through replacement and relie
   assert.match(installer, /database-released/);
   assert.doesNotMatch(installer, /launchctl kickstart/);
   assert.match(installer, /launchctl bootstrap/);
+});
+
+test("cockpit launcher safely recovers only the installer-managed LaunchAgent", () => {
+  assert.match(cockpitLauncher, /companion_is_healthy/);
+  assert.match(cockpitLauncher, /Recruiting Engine Product operator companion installer/);
+  assert.match(cockpitLauncher, /plutil -extract ManagedBy raw/);
+  assert.match(cockpitLauncher, /plutil -extract Label raw/);
+  assert.match(cockpitLauncher, /launchctl enable/);
+  assert.match(cockpitLauncher, /launchctl bootstrap/);
+  assert.match(cockpitLauncher, /launchctl kickstart/);
+  assert.doesNotMatch(cockpitLauncher, /launchctl kickstart -k/);
+  assert.doesNotMatch(cockpitLauncher, /rotate-pairing|repair-auth/);
 });
 
 test("restart guard quiesces legacy writers and selects no private job data", () => {

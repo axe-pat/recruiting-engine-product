@@ -146,6 +146,61 @@ function isLocalPrimarySurface(config: CompanionConfig): boolean {
   }
 }
 
+function canonicalLocalCockpitUrl(value: string): string | null {
+  if (!isLoopbackOrigin(value)) return null;
+  try {
+    return new URL("/app/", new URL(value).origin).toString();
+  } catch {
+    return null;
+  }
+}
+
+async function handoffHostedAppToLocalCockpit(baseUrl: string): Promise<boolean> {
+  const cockpitUrl = canonicalLocalCockpitUrl(baseUrl);
+  if (!cockpitUrl || isLoopbackOrigin(window.location.origin)) return false;
+
+  const localOrigin = new URL(cockpitUrl).origin;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 1600);
+  try {
+    // This public health probe intentionally carries no hosted credential. A
+    // browser that blocks HTTPS-to-loopback/PNA requests falls back to the
+    // explicit local-cockpit link rendered by the connection gate.
+    const response = await fetch(`${localOrigin}/api/v1/health`, {
+      method: "GET",
+      mode: "cors",
+      cache: "no-store",
+      credentials: "omit",
+      redirect: "error",
+      referrerPolicy: "no-referrer",
+      signal: controller.signal,
+    });
+    if (!response.ok || !response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+      return false;
+    }
+    const payload = (await response.json()) as {
+      status?: unknown;
+      version?: unknown;
+      mode?: unknown;
+      auth_required?: unknown;
+    };
+    if (
+      payload.status !== "ok"
+      || payload.version !== compatibleCompanionVersion
+      || payload.mode !== "local"
+      || payload.auth_required !== true
+    ) {
+      return false;
+    }
+    window.location.replace(cockpitUrl);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
 function sameCompanionConfig(left: CompanionConfig, right: CompanionConfig): boolean {
   return (
     left.baseUrl.trim().replace(/\/$/, "") === right.baseUrl.trim().replace(/\/$/, "")
@@ -640,13 +695,31 @@ export function AppFrame({ view }: { view: AppView }) {
       if (!isCurrent()) return false;
       setSnapshot(previewSnapshot);
       setOperatorOverview(null);
-      const activationRequired = isLocalPrimarySurface(nextConfig)
+      const localSurface = isLocalPrimarySurface(nextConfig);
+      const activationRequired = localSurface
         && error instanceof CompanionApiError
         && error.status === 401;
+      const hostedSessionExpired = !localSurface
+        && nextConfig.token.startsWith("re_web_")
+        && error instanceof CompanionApiError
+        && error.status === 401;
+      if (hostedSessionExpired) {
+        try {
+          window.sessionStorage.removeItem(sessionConfigKey);
+        } catch {
+          // The stale hosted credential remains unusable even if storage access is blocked.
+        }
+        const disconnectedConfig = { ...nextConfig, token: "" };
+        activeConfigRef.current = disconnectedConfig;
+        setConfig(disconnectedConfig);
+        void handoffHostedAppToLocalCockpit(disconnectedConfig.baseUrl);
+      }
       setConnection(activationRequired ? "activation" : (nextConfig.token || isLocalPrimarySurface(nextConfig)) ? "error" : "preview");
       setNotice(
         activationRequired
           ? `This browser needs one secure local activation. Run ${localCockpitLauncher} from the product folder; no pairing token is involved.`
+          : hostedSessionExpired
+            ? "The hosted tab session expired. Continue in the permanent local cockpit; no hosted credential is sent during that handoff."
           : error instanceof Error ? error.message : "Could not reach the companion.",
       );
       return false;
@@ -684,9 +757,13 @@ export function AppFrame({ view }: { view: AppView }) {
       }
 
       let nextConfig = defaultCompanionConfig;
+      let storedLoopbackOrigin = false;
       try {
         const storedOrigin = window.localStorage.getItem(originStorageKey);
-        if (storedOrigin) nextConfig = { ...nextConfig, baseUrl: storedOrigin };
+        if (storedOrigin) {
+          nextConfig = { ...nextConfig, baseUrl: storedOrigin };
+          storedLoopbackOrigin = isLoopbackOrigin(storedOrigin);
+        }
         const storedSession = window.sessionStorage.getItem(sessionConfigKey);
         if (storedSession) nextConfig = { ...nextConfig, ...(JSON.parse(storedSession) as CompanionConfig) };
       } catch {
@@ -698,6 +775,10 @@ export function AppFrame({ view }: { view: AppView }) {
       setConfig(nextConfig);
       if (!nextConfig.token) {
         setConnection("preview");
+        // Only a browser that previously saved this loopback origin is probed
+        // automatically. First-time hosted visitors get the explicit CTA and
+        // no unsolicited local-port request.
+        if (storedLoopbackOrigin) void handoffHostedAppToLocalCockpit(nextConfig.baseUrl);
         return;
       }
       await loadDashboard(nextConfig);
@@ -1191,6 +1272,9 @@ export function AppFrame({ view }: { view: AppView }) {
   };
 
   const active = navItems.find((item) => item.id === view) ?? navItems[0];
+  const localCockpitUrl = canonicalLocalCockpitUrl(config.baseUrl)
+    ?? canonicalLocalCockpitUrl(defaultCompanionConfig.baseUrl)
+    ?? "http://127.0.0.1:8765/app/";
   const mode: EngineMode = connection === "connected" ? "portable" : "preview";
   const operatorReviewProps = {
     onLoadReviewTarget: loadOperatorReviewTarget,
@@ -1289,7 +1373,7 @@ export function AppFrame({ view }: { view: AppView }) {
 
         <div className="app-content">
           {view !== "settings" && connection !== "connected" ? (
-            <ConnectionGate connection={connection} view={view} localPrimary={localPrimary} />
+            <ConnectionGate connection={connection} view={view} localPrimary={localPrimary} localCockpitUrl={localCockpitUrl} />
           ) : (
           <>
           {view === "dashboard" ? (workspaceMode === "existing" ? <OperatorWorkspace view={view} overview={operatorOverview} connected={connection === "connected"} onAction={runOperatorAction} {...operatorReviewProps} /> : <Dashboard snapshot={snapshot} mode={mode} workspaceMode={workspaceMode} existingEngine={existingEngine} existingSnapshot={existingSnapshot} />) : null}
@@ -1325,13 +1409,13 @@ export function AppFrame({ view }: { view: AppView }) {
   );
 }
 
-function ConnectionGate({ connection, view, localPrimary }: { connection: ConnectionState; view: AppView; localPrimary: boolean }) {
+function ConnectionGate({ connection, view, localPrimary, localCockpitUrl }: { connection: ConnectionState; view: AppView; localPrimary: boolean; localCockpitUrl: string }) {
   const checking = connection === "checking";
   const activation = connection === "activation";
   return (
     <section className="operator-empty app-panel connection-gate" aria-live="polite">
-      <span className="operator-kicker">{checking ? "Checking private companion" : activation ? "One-time secure browser activation" : localPrimary ? "Local cockpit service unavailable" : "Live data is disconnected"}</span>
-      <h2>{checking ? "Looking for your local recruiting engine…" : activation ? "Activate this browser once; keep using it without pairing tokens." : localPrimary ? "Restart the local companion to restore this workspace." : `Connect this Mac to open ${navItems.find((item) => item.id === view)?.label.toLowerCase() || "this workspace"}.`}</h2>
+      <span className="operator-kicker">{checking ? "Checking private companion" : activation ? "One-time secure browser activation" : localPrimary ? "Local cockpit service unavailable" : "Hosted session disconnected"}</span>
+      <h2>{checking ? "Looking for your local recruiting engine…" : activation ? "Activate this browser once; keep using it without pairing tokens." : localPrimary ? "Restart the local companion to restore this workspace." : `Continue in the permanent cockpit to open ${navItems.find((item) => item.id === view)?.label.toLowerCase() || "this workspace"}.`}</h2>
       <p>
         {checking
           ? "No records will appear until the authenticated local workspace responds."
@@ -1339,9 +1423,9 @@ function ConnectionGate({ connection, view, localPrimary }: { connection: Connec
             ? `From the RecruitingEngine Product folder, run ${localCockpitLauncher}. It opens a two-minute, single-use local link and stores only a protected HttpOnly cookie in this browser; subsequent reloads and normal companion restarts reconnect automatically.`
           : localPrimary
             ? "This browser is already device-bound and never needs a pairing token. The companion is not responding to authenticated same-origin requests right now."
-            : "No company, queue, run, or report shown on this screen is mock data. Pair the local companion to load your real workspace; fictional preview records are no longer rendered on operational routes."}
+            : "The hosted tab is optional and its private session expires after 12 hours. The permanent local cockpit reuses its protected browser cookie across normal restarts; no hosted credential is placed in the link or sent during navigation."}
       </p>
-      {activation ? <div><code>{localCockpitLauncher}</code><a href="/app/settings">Activation details →</a></div> : !checking ? <div>{localPrimary ? <a href="/app/settings">View local binding →</a> : <a href="/app/settings">Connect this Mac →</a>}<a href="/install">Open setup guide ↗</a></div> : null}
+      {activation ? <div><code>{localCockpitLauncher}</code><a href="/app/settings">Activation details →</a></div> : !checking ? <div>{localPrimary ? <a href="/app/settings">View local binding →</a> : <><a className="local-cockpit-cta" href={localCockpitUrl} referrerPolicy="no-referrer">Open permanent local cockpit →</a><a href="/app/settings">Pair this hosted tab instead</a></>}<a href="/install">Open setup guide ↗</a></div> : null}
     </section>
   );
 }
@@ -1784,6 +1868,9 @@ function SettingsView({
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState("");
   const existingReady = Boolean(existingEngine?.roots_available && existingEngine.production_guard === "configured" && (existingEngine.verified_run_count ?? 0) > 0);
+  const localCockpitUrl = canonicalLocalCockpitUrl(config.baseUrl)
+    ?? canonicalLocalCockpitUrl(defaultCompanionConfig.baseUrl)
+    ?? "http://127.0.0.1:8765/app/";
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -1821,11 +1908,20 @@ function SettingsView({
             <div><strong>Connected in this tab</strong><p>The one-time pairing token was consumed successfully. This tab now uses a short-lived private session, so pasting the same token again will correctly be rejected.</p><small>{config.baseUrl}</small></div>
           </div>
         ) : (
-          <form onSubmit={submit}>
-            <label>Companion address<input type="url" value={draft.baseUrl} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} required /></label>
-            <label>One-time pairing token<input type="password" value={draft.token} onChange={(event) => setDraft({ ...draft, token: event.target.value })} placeholder="Paste a fresh re_pair_ token" required /></label>
-            <button className="run-button" type="submit" disabled={saving}>{saving ? "Checking…" : "Connect this tab"}</button>
-          </form>
+          <>
+            <aside className="local-cockpit-handoff">
+              <span>Recommended daily path</span>
+              <strong>Use the permanent cockpit on this Mac.</strong>
+              <p>It uses the restart-stable local cookie and never places the hosted session token in a URL.</p>
+              <a className="local-cockpit-cta" href={localCockpitUrl} referrerPolicy="no-referrer">Open permanent local cockpit →</a>
+            </aside>
+            <form onSubmit={submit}>
+              <span className="hosted-pairing-alternative">Optional · pair only this hosted tab for 12 hours</span>
+              <label>Companion address<input type="url" value={draft.baseUrl} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} required /></label>
+              <label>One-time pairing token<input type="password" value={draft.token} onChange={(event) => setDraft({ ...draft, token: event.target.value })} placeholder="Paste a fresh re_pair_ token" required /></label>
+              <button className="run-button" type="submit" disabled={saving}>{saving ? "Checking…" : "Connect this tab"}</button>
+            </form>
+          </>
         )}
         {formError ? <p className="settings-form-error" role="alert">{formError}</p> : null}
         <p className="settings-status"><span className={`connection-dot dot-${connection}`} />{statusLabel(connection, localPrimary)}</p>

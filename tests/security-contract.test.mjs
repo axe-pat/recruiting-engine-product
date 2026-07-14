@@ -14,6 +14,10 @@ const operatorOverviewContract = operatorContract.slice(
   operatorContract.indexOf("export type OperatorOverview"),
   operatorContract.indexOf("export type OperatorActionResult"),
 );
+const hostedHandoffContract = appFrame.slice(
+  appFrame.indexOf("async function handoffHostedAppToLocalCockpit"),
+  appFrame.indexOf("function sameCompanionConfig"),
+);
 
 test("hosted pairing is explicit, short-lived, and tab-scoped", () => {
   assert.match(appFrame, /client_type:\s*"web"/);
@@ -28,12 +32,23 @@ test("hosted pairing is explicit, short-lived, and tab-scoped", () => {
   assert.match(appFrame, /Connected in this tab/);
 });
 
-test("hosted preview probes only its own loopback origin before user intent", () => {
+test("hosted handoff probes only a previously configured loopback without credentials", () => {
   assert.match(appFrame, /if \(isLoopbackOrigin\(window\.location\.origin\)\)[\s\S]{0,180}localPrimaryBootstrap/);
-  assert.match(appFrame, /if \(!nextConfig\.token\)[\s\S]{0,120}setConnection\("preview"\)/);
+  assert.match(appFrame, /storedLoopbackOrigin = isLoopbackOrigin\(storedOrigin\)/);
+  assert.match(appFrame, /if \(!nextConfig\.token\)[\s\S]{0,360}if \(storedLoopbackOrigin\) void handoffHostedAppToLocalCockpit/);
+  assert.match(hostedHandoffContract, /credentials: "omit"/);
+  assert.match(hostedHandoffContract, /redirect: "error"/);
+  assert.match(hostedHandoffContract, /referrerPolicy: "no-referrer"/);
+  assert.match(hostedHandoffContract, /payload\.version !== compatibleCompanionVersion/);
+  assert.match(hostedHandoffContract, /payload\.mode !== "local"/);
+  assert.match(hostedHandoffContract, /payload\.auth_required !== true/);
+  assert.match(hostedHandoffContract, /window\.location\.replace\(cockpitUrl\)/);
+  assert.doesNotMatch(hostedHandoffContract, /Authorization|companionHeaders|sessionConfigKey|\.token/);
   assert.doesNotMatch(appFrame, /fetch\(["'`]http:\/\/(?:127\.0\.0\.1|localhost)/);
+  assert.match(appFrame, /Open permanent local cockpit/);
+  assert.match(appFrame, /referrerPolicy="no-referrer"/);
   assert.match(appFrame, /view !== "settings" && connection !== "connected"/);
-  assert.match(appFrame, /fictional preview records are no longer rendered on operational routes/);
+  assert.match(appFrame, /no hosted credential is placed in the link or sent during navigation/);
 });
 
 test("the same-origin local cockpit authenticates without browser-readable tokens", () => {

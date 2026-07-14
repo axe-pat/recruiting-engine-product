@@ -41,7 +41,12 @@ server detection header, and no `Set-Cookie`.
 Hosted pages continue to use a one-time pairing code and a short-lived,
 tab-scoped web session. The Chrome companion continues to use its local bearer.
 Those are separate clients and neither is required to reopen the canonical local
-UI.
+UI. When a hosted operational tab has a previously configured loopback origin
+but no usable session, it performs one credential-free health/version probe and
+hands off to `/app/` only after the expected local companion responds. Browsers
+that block the probe under private-network or mixed-content policy keep a
+prominent direct local-cockpit link instead. Neither path places a hosted token
+in the destination URL.
 
 ## What it operates
 
@@ -228,14 +233,21 @@ An agent taking over this surface should follow this order:
 
 - **The local URL does not load:** check the health endpoint, LaunchAgent state,
   and companion error log. Confirm that `static-export/app/index.html` and
-  `static-export/assets/` exist and are regular, non-symlink entries.
+  `static-export/assets/` exist and are regular, non-symlink entries. The normal
+  `scripts/open-operator-cockpit.sh` launcher first tries to re-enable, load,
+  and start the installer-managed LaunchAgent when health is unavailable; it
+  does not replace the plist, rotate auth, or kill an unhealthy live process.
 - **The local UI says activation required:** run
   `scripts/open-operator-cockpit.sh`. Do not show or rotate hosted pairing
   material. If private bearer/state validation fails, use the explicitly
   reported `python3 -m recruiting_companion repair-auth` command; it rotates all
   auth sessions and reports paths, never secrets.
-- **The hosted page asks to pair:** that is expected for the hosted path. Use the
-  canonical local URL for daily operation.
+- **The hosted page asks to pair or says its session expired:** that is expected
+  after the hosted path's 12-hour tab session ends. Do not rotate pairing for
+  daily operation. The hosted operational UI will hand off automatically after
+  positive local health/version evidence when browser policy permits; otherwise
+  use its **Open permanent local cockpit** button. The protected local cookie is
+  browser-profile scoped and lasts across normal browser and service restarts.
 - **Progress appears partial:** inspect lock state and exact run artifacts. A
   partial projection is a safety response, not permission to start another run.
 - **A LinkedIn browser remains after terminal state:** verify the upstream run's

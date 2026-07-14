@@ -104,7 +104,10 @@ For the normal local workflow, open:
 scripts/open-operator-cockpit.sh
 ```
 
-The launcher validates the mode-`0600` private bearer against hash-only auth
+If health is unavailable, the launcher safely re-enables, loads, and starts the
+installer-managed LaunchAgent before opening the UI. It never replaces an
+unmanaged plist, rotates authentication, or kills an unhealthy live process.
+The launcher then validates the mode-`0600` private bearer against hash-only auth
 state, creates a hash-only single-use activation ticket with a two-minute
 maximum lifetime, captures it without printing it, and opens a same-origin URL
 whose fragment is removed from history before exchange. Raw HTML never mints a
@@ -138,6 +141,11 @@ A pairing code is consumed once. After a successful exchange, the hosted tab
 uses a 12-hour, tab-scoped `re_web_` session and Settings shows **Connected**.
 Do not paste the same `re_pair_` value again; disconnect the hosted tab and
 rotate the pairing code only when a new hosted session is actually needed.
+When that hosted session is absent or expired, a previously configured loopback
+origin receives one credential-free health/version probe. A matching companion
+hands the operational tab to its canonical `/app/`; browser private-network or
+mixed-content blocks leave a prominent **Open permanent local cockpit** link.
+The hosted token is never copied into that link or navigation.
 
 ## Daily operator runbook
 

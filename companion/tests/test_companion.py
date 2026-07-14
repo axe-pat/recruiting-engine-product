@@ -2265,6 +2265,19 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
                 requested_scope="local",
             )
             self.assertEqual(duplicate_review["id"], status_review["id"])
+            local_ui_review = backend.create_review(
+                command_id="application.status.applied",
+                target_id=status_target["target_id"],
+                requested_scope="local_ui",
+            )
+            self.assertEqual(local_ui_review["id"], status_review["id"])
+            with self.assertRaises(ValidationError) as scope_error:
+                backend.create_review(
+                    command_id="application.status.applied",
+                    target_id=status_target["target_id"],
+                    requested_scope="browser",
+                )
+            self.assertIn("requested_scope", scope_error.exception.message)
             with backend.db.connect() as connection:
                 review_indexes = {
                     row["name"]: bool(row["unique"])

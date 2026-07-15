@@ -153,15 +153,18 @@ leaves approval unconsumed. After a successful preflight, approval is consumed,
 the companion mutation lock is released, and only then is `nightly_prompt.py`
 spawned so its scheduler/pipeline lock order cannot deadlock.
 
-The top-bar **Run E2E** control opens this exact nightly target directly; it does
-not bypass the review ledger. The user still stages the target, records review,
-approves it, and enters `RUN_REVIEWED_NIGHTLY` before the fixed production
-process can start. This is a live reviewed production contract with bounded
-application-queue and Track 2 LinkedIn delivery, not a report-only/no-send test;
-email remains separately recipient-reviewed. **Refresh** remains a separate
-read-only control. If a scheduled run is already active, the control routes to
-its progress instead of treating the absence of an operator job as permission
-to start a duplicate.
+The top-bar **Run E2E** control is one click but does not bypass the review
+ledger. It drives the same durable state machine programmatically: it stages the
+exact nightly target if none is staged, records review and approval through the
+authenticated review endpoints with their fixed confirmation phrases, and only
+then submits the `nightly.run` job bound to that approved review. Every step
+still lands in the audit ledger, approval is still consumed before process
+spawn, and the same attestation preflights still gate execution. This is a live
+reviewed production contract with bounded application-queue and Track 2 LinkedIn
+delivery, not a report-only/no-send test; email remains separately
+recipient-reviewed. **Refresh** remains a separate read-only control. If a
+scheduled run is already active, the control routes to its progress instead of
+treating the absence of an operator job as permission to start a duplicate.
 
 After the process exits, the companion requires exactly one newly created run to
 pass the summary, manifest, source-metrics, action-queue, and Outreach report
@@ -277,6 +280,17 @@ must be an object array whose reported count exactly matches its length; the
 adapter makes no cross-lane identity-exclusivity claim. `/app/plan` shows the
 basis run and evidence category for each row. During a newer active run it is
 explicitly partial and rebases only after the new full evidence chain verifies.
+
+The plan surface also binds the Track 2 daily plan resolved through the verified
+manifest chain (manifest → daily-run artifact → plan artifact; never a loose
+`latest` file). Each ranked company row carries its planned action, channel,
+phase, and expected counts (invites, follow-ups, mapping, email research,
+enrichment, drafts), and the surface shows the plan's declared daily budgets.
+Plan entries are merged with the action-queue rows by company; rows that exist
+only in one source are kept and ranked after the merged set. The projection is a
+pre-reconciliation prediction: inbox reconciliation and cadence guards run at
+execution time, so a planned follow-up can legitimately end as a manual-review
+or cadence-hold outcome in the run report.
 
 ## Start it on this Mac
 

@@ -183,8 +183,10 @@ projection together, and the open action explains its current availability.
 ### Production nightly semantics
 
 **Run E2E** is a reviewed off-cycle production nightly, not a report-only or
-no-send test. It stages one exact target, requires review and approval, then
-requires `RUN_REVIEWED_NIGHTLY`. Execution reuses the attested canonical nightly
+no-send test. One click stages the exact target, records review and approval
+through the durable ledger with the fixed confirmation phrases, and submits the
+`RUN_REVIEWED_NIGHTLY` job bound to that approval — the same audited state
+machine, driven automatically. Execution reuses the attested canonical nightly
 argument vector, including bounded application-queue delivery and Track 2
 LinkedIn delivery. Email remains separately recipient-reviewed.
 

@@ -863,6 +863,7 @@ function NextRunPlanSurface({ plan, progress, commands, onSelect }: { plan: Unkn
   const queueReturned = number(plan.queue_items_returned, queueItems.length);
   const queueTruncated = Boolean(plan.queue_items_truncated);
   const queueStatus = text(plan.queue_items_status, queueItems.length ? "available" : "unavailable");
+  const highLeveragePeople = asList(plan.high_leverage_people);
   return (
     <>
       {currentRun ? <CurrentRunProgressCard progress={progress} compact /> : null}
@@ -913,7 +914,25 @@ function NextRunPlanSurface({ plan, progress, commands, onSelect }: { plan: Unkn
         ) : (
           <p className="operator-empty-row">{text(plan.queue_items_reason, "No exact action-queue rows are bound yet.")}</p>
         )}
+        {number(plan.automatic_followups_hidden, 0) > 0 ? <p className="operator-boundary-note">{number(plan.automatic_followups_hidden, 0)} automatic follow-up / continue-conversation actions run inside the nightly and are hidden from this decision queue.</p> : null}
       </section>
+      {highLeveragePeople.length ? (
+        <section className="operator-panel">
+          <div className="operator-panel-head"><div><span>High-leverage people</span><h3>Senior contacts with a warm path</h3></div><small>{highLeveragePeople.length} flagged</small></div>
+          <div className="operator-row-list">
+            {highLeveragePeople.map((person, index) => (
+              <article key={`${text(person.company, `${index}`)}`}>
+                <span>{text(person.tier, "") ? `Tier ${text(person.tier, "")}` : "account"}</span>
+                <div>
+                  <strong>{text(person.company, "Unnamed company")}</strong>
+                  <p>{text(person.contacts, "")}</p>
+                </div>
+                <small>score {number(person.account_score, 0)}</small>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
       {queueTruncated ? <p className="operator-boundary-note">This is a bounded projection showing {queueReturned} of {queueTotal} exact action-queue rows from the basis run.</p> : null}
       {text(plan.plan_reason, "") ? <p className="operator-boundary-note">{text(plan.plan_reason, "")} Rows show action-queue data without planned counts.</p> : null}
       {text(budgets.note) ? <p className="operator-boundary-note">{text(budgets.note)}</p> : null}

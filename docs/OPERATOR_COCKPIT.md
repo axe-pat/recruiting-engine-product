@@ -292,6 +292,13 @@ pre-reconciliation prediction: inbox reconciliation and cadence guards run at
 execution time, so a planned follow-up can legitimately end as a manual-review
 or cadence-hold outcome in the run report.
 
+The queue is a decision surface: automatic cadence actions
+(`continue_conversation`, `follow_up_connected_contact`) run inside the nightly
+and are hidden from the ranked rows — the surface reports how many were hidden.
+When the bound plan carries a `high_leverage_people` lane (senior titles with a
+real warm path — USC/Marshall, Thapar, India network, shared employer), those
+accounts render as their own panel under the ranked queue.
+
 ## Start it on this Mac
 
 Build `static-export/`, install the loopback LaunchAgent, and open

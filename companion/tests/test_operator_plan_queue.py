@@ -10,7 +10,9 @@ from recruiting_companion.config import Settings
 from recruiting_companion.operator_backend import (
     OperatorBackend,
     _combine_plan_and_queue_rows,
+    _count_automatic_plan_followups,
     _planned_action_summary,
+    _project_high_leverage_people,
     _project_next_run_queue_items,
     _project_track_2_plan_entries,
 )
@@ -99,6 +101,25 @@ def _track_2_plan_payload() -> dict[str, object]:
                 "reason": "Only 0 relevant contacts mapped.",
                 "target_role": "Product Manager Intern",
             },
+            {
+                "company": "WarmChat",
+                "tier": "A",
+                "campaign_action": "continue_conversation",
+                "campaign_channel": "linkedin",
+                "phase": "1_continue_live_conversations",
+                "account_score": 60,
+                "expected_linkedin_followups": 1,
+                "reason": "Live conversation in flight.",
+            },
+        ],
+        "high_leverage_people": [
+            {
+                "company": "Salesforce",
+                "tier": "L1",
+                "account_score": 58,
+                "contacts": "Warm Exec (VP Product at Salesforce)",
+                "contact_count": 1,
+            }
         ],
     }
 
@@ -127,6 +148,23 @@ class OperatorPlanQueueTests(unittest.TestCase):
         )
         self.assertIn("10 invites", entries[0]["action_summary"])
         self.assertEqual(entries[1]["planned_action"], "map_more_contacts")
+        # Automatic conversation actions are excluded from the decision queue.
+        self.assertNotIn(
+            "WarmChat", [entry["company"] for entry in entries]
+        )
+
+    def test_automatic_followups_are_counted_not_listed(self) -> None:
+        self.assertEqual(
+            _count_automatic_plan_followups(_track_2_plan_payload()), 1
+        )
+
+    def test_project_high_leverage_people_bounds_fields(self) -> None:
+        lane = _project_high_leverage_people(_track_2_plan_payload())
+        self.assertEqual(len(lane), 1)
+        self.assertEqual(lane[0]["company"], "Salesforce")
+        self.assertEqual(lane[0]["tier"], "L1")
+        self.assertIn("Warm Exec", lane[0]["contacts"])
+        self.assertEqual(_project_high_leverage_people({}), [])
 
     def test_combine_plan_and_queue_rows_merges_and_appends(self) -> None:
         plan_entries = _project_track_2_plan_entries(_track_2_plan_payload())
@@ -352,6 +390,10 @@ class OperatorPlanQueueTests(unittest.TestCase):
             salesforce = plan["queue_items"][0]
             self.assertEqual(salesforce["planned_action"], "send_initial_invites")
             self.assertIn("10 invites", salesforce["action_summary"])
+            self.assertEqual(plan["automatic_followups_hidden"], 1)
+            self.assertEqual(
+                plan["high_leverage_people"][0]["company"], "Salesforce"
+            )
 
     def test_next_run_plan_fails_closed_on_missing_queue_binding(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

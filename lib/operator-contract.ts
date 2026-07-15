@@ -227,6 +227,14 @@ export type OperatorNextRunPlan = {
   queue_items_limit?: number;
   queue_items_status?: "available" | "partial" | "unavailable";
   queue_items_reason?: string;
+  automatic_followups_hidden?: number;
+  high_leverage_people?: Array<{
+    company?: string;
+    tier?: string;
+    account_score?: number;
+    contacts?: string;
+    contact_count?: number;
+  }>;
 };
 
 export type OperatorAccountTracker = {

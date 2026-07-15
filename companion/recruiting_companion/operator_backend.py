@@ -6055,9 +6055,13 @@ class OperatorBackend:
         plan_reason = ""
         plan_entries: list[dict[str, Any]] = []
         plan_sha = ""
+        automatic_followups = 0
+        high_leverage_people: list[dict[str, Any]] = []
         try:
             plan, plan_sha = self._exact_track_2_plan(exact_evidence)
             plan_entries = _project_track_2_plan_entries(plan)
+            automatic_followups = _count_automatic_plan_followups(plan)
+            high_leverage_people = _project_high_leverage_people(plan)
             plan_budget = plan.get("budget")
             if isinstance(plan_budget, dict):
                 for key in (
@@ -6103,6 +6107,8 @@ class OperatorBackend:
             "queue_items_reason": "",
             "plan_status": plan_status,
             "plan_reason": plan_reason,
+            "automatic_followups_hidden": automatic_followups,
+            "high_leverage_people": high_leverage_people,
         }
 
     def _exact_track_2_plan(
@@ -7383,6 +7389,12 @@ def _planned_action_summary(action: str, counts: dict[str, int]) -> str:
     return f"{verb} · {', '.join(parts)}"
 
 
+# Cadence-driven message actions run automatically inside the nightly; they
+# are noise in a decision queue that should surface mapping, invites, and new
+# outreach the operator can actually reorder.
+_AUTOMATIC_PLAN_ACTIONS = {"continue_conversation", "follow_up_connected_contact"}
+
+
 def _project_track_2_plan_entries(plan: dict[str, Any]) -> list[dict[str, Any]]:
     """Project the plan's selected companies with actions and expected counts."""
     selected = plan.get("selected")
@@ -7396,6 +7408,8 @@ def _project_track_2_plan_entries(plan: dict[str, Any]) -> list[dict[str, Any]]:
         if not company:
             continue
         action = _safe_queue_text(raw.get("campaign_action"), limit=64)
+        if action in _AUTOMATIC_PLAN_ACTIONS:
+            continue
         counts: dict[str, int] = {}
         for key, _plural, _singular in _PLAN_COUNT_LABELS:
             value = _bounded_operator_count(raw.get(key))
@@ -7418,6 +7432,43 @@ def _project_track_2_plan_entries(plan: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return entries
+
+
+def _count_automatic_plan_followups(plan: dict[str, Any]) -> int:
+    selected = plan.get("selected")
+    if not isinstance(selected, list):
+        return 0
+    return sum(
+        1
+        for raw in selected
+        if isinstance(raw, dict)
+        and str(raw.get("campaign_action") or "") in _AUTOMATIC_PLAN_ACTIONS
+    )
+
+
+def _project_high_leverage_people(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Project the plan's high-leverage people lane (senior + warm path)."""
+    raw_lane = plan.get("high_leverage_people")
+    if not isinstance(raw_lane, list):
+        return []
+    lane: list[dict[str, Any]] = []
+    for raw in raw_lane[:12]:
+        if not isinstance(raw, dict):
+            continue
+        company = _safe_queue_text(raw.get("company"), limit=80)
+        contacts = _safe_queue_text(raw.get("contacts"), limit=240)
+        if not company or not contacts:
+            continue
+        lane.append(
+            {
+                "company": company,
+                "tier": _safe_queue_text(raw.get("tier"), limit=8),
+                "account_score": _bounded_operator_count(raw.get("account_score")),
+                "contacts": contacts,
+                "contact_count": _bounded_operator_count(raw.get("contact_count")),
+            }
+        )
+    return lane
 
 
 def _combine_plan_and_queue_rows(

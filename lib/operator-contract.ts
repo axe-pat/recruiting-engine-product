@@ -185,6 +185,48 @@ export type OperatorNextRunPlan = {
   items_total?: number;
   truncated?: boolean;
   limit?: number;
+  budgets?: {
+    schema_version?: string;
+    source?: string;
+    max_total_actions?: number;
+    max_companies?: number;
+    max_linkedin_invites?: number;
+    max_linkedin_followups?: number;
+    max_company_mapping?: number;
+    max_email_research?: number;
+    max_context_enrichment?: number;
+    max_email_drafts?: number;
+    note?: string;
+  };
+  queue_items?: Array<{
+    id?: string;
+    rank?: number;
+    company?: string;
+    role_title?: string;
+    lane?: string;
+    target_run?: string;
+    reasons?: string[];
+    fit_score?: number | null;
+    queue_rank?: number | null;
+    recommended_action?: string;
+    source?: string;
+    planned_action?: string;
+    planned_channel?: string;
+    plan_phase?: string;
+    planned_counts?: Record<string, number>;
+    action_summary?: string;
+    tier?: string;
+    account_score?: number | null;
+    evidence?: { kind?: string; run_id?: string; lane?: string; sha256?: string };
+  }>;
+  plan_status?: "bound" | "unavailable";
+  plan_reason?: string;
+  queue_items_returned?: number;
+  queue_items_total?: number;
+  queue_items_truncated?: boolean;
+  queue_items_limit?: number;
+  queue_items_status?: "available" | "partial" | "unavailable";
+  queue_items_reason?: string;
 };
 
 export type OperatorAccountTracker = {

@@ -857,10 +857,22 @@ function NextRunPlanSurface({ plan, progress, commands, onSelect }: { plan: Unkn
   const categories = new Set(items.map((item) => text(item.category, "other")));
   const currentRun = Boolean(plan.current_run_in_progress) || (progress.status === "running" && Boolean(progress.is_current));
   const runControls = commands.filter((command) => command.id === "nightly.run" || command.id === "production.preflight" || command.id === "reports.daily.refresh");
+  const budgets = asRecord(plan.budgets);
+  const queueItems = asList(plan.queue_items);
+  const queueTotal = number(plan.queue_items_total, queueItems.length);
+  const queueReturned = number(plan.queue_items_returned, queueItems.length);
+  const queueTruncated = Boolean(plan.queue_items_truncated);
+  const queueStatus = text(plan.queue_items_status, queueItems.length ? "available" : "unavailable");
   return (
     <>
       {currentRun ? <CurrentRunProgressCard progress={progress} compact /> : null}
       <section className="operator-metrics"><article><span>Plan items</span><strong>{total}</strong><small>{returned} shown</small></article><article><span>High priority</span><strong>{highPriority}</strong><small>First-pass work</small></article><article><span>Workstreams</span><strong>{categories.size}</strong><small>Evidence-derived</small></article><article><span>Basis run</span><strong className="metric-compact">{text(plan.basis_run_id, "Unavailable")}</strong><small>{text(plan.basis_run_status, "No exact basis")}</small></article></section>
+      <section className="operator-metrics">
+        <article><span>Invite target</span><strong>{number(budgets.max_linkedin_invites)}</strong><small>LinkedIn invites</small></article>
+        <article><span>Follow-ups</span><strong>{number(budgets.max_linkedin_followups)}</strong><small>Track 2 budget</small></article>
+        <article><span>Mapping</span><strong>{number(budgets.max_company_mapping)}</strong><small>Company passes</small></article>
+        <article><span>Queue rows</span><strong>{queueTotal}</strong><small>{queueStatus} · {queueReturned} shown</small></article>
+      </section>
       <section className="operator-panel operator-next-plan">
         <div className="operator-panel-head"><div><span>Prioritized action plan</span><h3>{currentRun ? "Working plan while tonight’s run is active" : "Next cycle, in evidence order"}</h3></div><small>{returned} of {total}{Boolean(plan.truncated) ? " · bounded view" : ""}</small></div>
         {items.length ? <div className="operator-plan-list">{items.map((item, index) => {
@@ -869,6 +881,42 @@ function NextRunPlanSurface({ plan, progress, commands, onSelect }: { plan: Unkn
           return <article key={text(item.id, `${index}`)}><span className="operator-plan-rank">{String(index + 1).padStart(2, "0")}</span><div><small>{text(item.category, "run")} · {text(item.priority, "normal")} priority</small><h3>{text(item.title, "Untitled action")}</h3><p>{text(item.reason, "Exact run evidence supports this next action.")}</p><em>{evidenceBits.length ? evidenceBits.join(" · ") : "Evidence binding retained locally"}</em></div>{item.count !== null && item.count !== undefined ? <strong>{number(item.count)}</strong> : null}</article>;
         })}</div> : <p className="operator-empty-row">{text(plan.reason, "No grounded next-run actions are available yet.")}</p>}
       </section>
+      <section className="operator-panel">
+        <div className="operator-panel-head"><div><span>Exact action queue</span><h3>Ranked companies before the next run</h3></div><small>{queueReturned} of {queueTotal}{queueTruncated ? " · bounded view" : ""}</small></div>
+        {queueItems.length ? (
+          <div className="operator-queue-table operator-next-queue-scroll">
+            {queueItems.map((item, index) => {
+              const reasons = stringList(item.reasons).slice(0, 3).join(" · ");
+              const fit = typeof item.fit_score === "number" && item.fit_score > 0 ? item.fit_score.toFixed(1) : "—";
+              const summary = text(item.action_summary, text(item.recommended_action, "Queued").replaceAll("_", " "));
+              const phase = text(item.plan_phase, "").replace(/^\d+_/, "").replaceAll("_", " ");
+              const tier = text(item.tier, "");
+              const laneLabel = text(item.lane, "lane") === "track_2_plan" ? "Track 2 plan" : text(item.lane, "lane").replaceAll("_", " ");
+              return (
+                <article key={text(item.id, `${index}`)}>
+                  <span className="operator-rank">{number(item.rank, index + 1)}</span>
+                  <div>
+                    <strong>{text(item.company, "Unnamed company")}{tier ? ` · Tier ${tier}` : ""}</strong>
+                    <p>{summary}</p>
+                    <small>{laneLabel}{phase ? ` · ${phase}` : ""} · {text(item.target_run, "next run").replaceAll("-", " ")}{reasons ? ` · ${reasons}` : ""}</small>
+                  </div>
+                  <div className="operator-materials">
+                    <span className="ready">{text(item.planned_channel, text(item.source, "source")).replaceAll("_", " ")}</span>
+                    {text(item.role_title, "") ? <span className="optional">{text(item.role_title, "")}</span> : null}
+                  </div>
+                  <div className="operator-item-actions"><small>{text(asRecord(item.evidence).run_id, text(plan.basis_run_id, "—"))}</small></div>
+                  <strong className="operator-score">{fit}</strong>
+                </article>
+              );
+            })}
+          </div>
+        ) : (
+          <p className="operator-empty-row">{text(plan.queue_items_reason, "No exact action-queue rows are bound yet.")}</p>
+        )}
+      </section>
+      {queueTruncated ? <p className="operator-boundary-note">This is a bounded projection showing {queueReturned} of {queueTotal} exact action-queue rows from the basis run.</p> : null}
+      {text(plan.plan_reason, "") ? <p className="operator-boundary-note">{text(plan.plan_reason, "")} Rows show action-queue data without planned counts.</p> : null}
+      {text(budgets.note) ? <p className="operator-boundary-note">{text(budgets.note)}</p> : null}
       {currentRun ? <p className="operator-boundary-note">This plan is intentionally provisional while the current run is active. It will rebase on the new exact summary, source metrics, action queue, and report after final verification.</p> : null}
       <CommandSection title="Next-run controls" commands={runControls} onSelect={onSelect} />
     </>

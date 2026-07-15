@@ -978,7 +978,99 @@ export function AppFrame({ view }: { view: AppView }) {
       return;
     }
     if (workspaceMode === "existing") {
-      window.location.assign(scheduledRunActive ? "/app/runs" : cockpitJobActive ? "/app/operations" : "/app/runs?start=nightly");
+      if (scheduledRunActive) {
+        window.location.assign("/app/runs");
+        return;
+      }
+      if (cockpitJobActive) {
+        window.location.assign("/app/operations");
+        return;
+      }
+      setRunning(true);
+      setNotice("Verifying the exact production contract and starting one bounded E2E run…");
+      try {
+        const reviewQueue = operatorOverview?.review_queue;
+        const lane = reviewQueue?.lanes?.find((candidate) => candidate.command_id === "nightly.run");
+        const target = lane?.targets?.[0];
+        if (!target || lane?.execution_state !== "available") {
+          throw new Error(lane?.reason || "No exact production-nightly target is available.");
+        }
+
+        let review = reviewQueue?.recent_reviews?.find((candidate) =>
+          candidate.command_id === "nightly.run"
+          && candidate.target_id === target.target_id
+          && ["pending", "reviewed", "approved"].includes(candidate.state));
+
+        if (!review) {
+          const created = await apiRequest<OperatorReviewResult>(config, "/api/v1/operator/reviews", {
+            method: "POST",
+            body: JSON.stringify({
+              command_id: "nightly.run",
+              target_id: target.target_id,
+              reviewed_text: "",
+              reviewed_subject: "",
+            }),
+          });
+          review = created.operator_review;
+        }
+        if (!review) throw new Error("The exact production review could not be staged.");
+
+        if (review.state === "pending") {
+          const reviewed = await apiRequest<OperatorReviewResult>(
+            config,
+            `/api/v1/operator/reviews/${encodeURIComponent(review.id)}/review`,
+            {
+              method: "POST",
+              body: JSON.stringify({
+                confirmation: review.review_confirmation_phrase || "REVIEW_EXACT_TARGET",
+              }),
+            },
+          );
+          review = reviewed.operator_review;
+        }
+        if (!review) throw new Error("The exact production review could not be recorded.");
+
+        if (review.state === "reviewed") {
+          const approved = await apiRequest<OperatorReviewResult>(
+            config,
+            `/api/v1/operator/reviews/${encodeURIComponent(review.id)}/approve`,
+            {
+              method: "POST",
+              body: JSON.stringify({
+                confirmation: review.approval_confirmation_phrase || "APPROVE_EXACT_TARGET",
+              }),
+            },
+          );
+          review = approved.operator_review;
+        }
+        if (!review || review.state !== "approved") {
+          throw new Error("The exact production contract was not approved.");
+        }
+
+        const result = await apiRequest<OperatorActionResult>(config, "/api/v1/operator/jobs", {
+          method: "POST",
+          body: JSON.stringify({
+            command_id: "nightly.run",
+            confirmation: review.action_confirmation_phrase || "RUN_REVIEWED_NIGHTLY",
+            parameters: {
+              review_id: review.id,
+              target_id: review.target_id,
+            },
+          }),
+        });
+        const job = result.job ?? result.operator_job;
+        if (!job || !["queued", "running"].includes(String(job.status))) {
+          throw new Error(job?.summary || "The bounded E2E run was not accepted.");
+        }
+        setNotice("E2E run accepted. Opening live progress…");
+        await loadDashboard(config);
+        window.location.assign("/app/runs");
+      } catch (error) {
+        await loadDashboard(config);
+        setNotice(error instanceof Error ? error.message : "The E2E run could not start.");
+      } finally {
+        setRunning(false);
+      }
       return;
     }
     setRunning(true);

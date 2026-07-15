@@ -28,6 +28,7 @@ from .existing_adapter import (
     MutableSnapshotCapture,
     MutableSnapshotChanged,
     MutableSnapshotUnavailable,
+    _validated_action_queue_lane_counts,
 )
 from .service import ConflictError, NotFoundError, ValidationError, new_id, utc_now
 
@@ -41,6 +42,7 @@ _MAX_XLSX_EXPANDED_BYTES = 256 * 1024 * 1024
 _MAX_REPORT_HTML_BYTES = 5 * 1024 * 1024
 _OPERATOR_JOB_LIMIT = 100
 _QUEUE_ITEM_LIMIT = 100
+_NEXT_RUN_QUEUE_LIMIT = 150
 _REPORT_ITEM_LIMIT = 20
 _ACCOUNT_ACTION_LIMIT = 50
 _STORY_ITEM_LIMIT = 50
@@ -5568,6 +5570,14 @@ class OperatorBackend:
             in {"running", "attention", "partial"}
         )
         latest = run_projections[-1] if run_projections else None
+        queue_surface = self._next_run_queue_surface(latest)
+
+        def finalize(payload: dict[str, Any]) -> dict[str, Any]:
+            merged = dict(payload)
+            merged.update(queue_surface)
+            merged["schema_version"] = "1.1"
+            return merged
+
         run_id = str(latest.get("run_id") or "") if latest else ""
         current_items: list[dict[str, Any]] = []
         current_counts = (
@@ -5676,7 +5686,7 @@ class OperatorBackend:
                     evidence_kinds.append("exact active-run scoring evidence")
                 if review_items:
                     evidence_kinds.append("the current durable review ledger")
-                return {
+                return finalize({
                     "schema_version": "1.0",
                     "status": "partial",
                     "reason": (
@@ -5695,8 +5705,8 @@ class OperatorBackend:
                     "items_total": total,
                     "truncated": total > _NEXT_RUN_PLAN_LIMIT,
                     "limit": _NEXT_RUN_PLAN_LIMIT,
-                }
-            return {
+                })
+            return finalize({
                 "schema_version": "1.0",
                 "status": "unavailable",
                 "reason": (
@@ -5713,7 +5723,7 @@ class OperatorBackend:
                 "items_total": 0,
                 "truncated": False,
                 "limit": _NEXT_RUN_PLAN_LIMIT,
-            }
+            })
 
         run_status = str(latest.get("status") or "attention")
         evidence = latest.get("evidence")
@@ -5951,7 +5961,7 @@ class OperatorBackend:
                 "The latest exact run and current durable review ledger expose "
                 "no queued next-run actions."
             )
-        return {
+        return finalize({
             "schema_version": "1.0",
             "status": status,
             "reason": reason,
@@ -5965,7 +5975,178 @@ class OperatorBackend:
             "items_total": total,
             "truncated": total > _NEXT_RUN_PLAN_LIMIT,
             "limit": _NEXT_RUN_PLAN_LIMIT,
+        })
+
+    def _next_run_queue_surface(
+        self,
+        latest: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        budgets = {
+            "schema_version": "1.0",
+            "source": "track_2_daily_plan_defaults",
+            "max_total_actions": 24,
+            "max_companies": 18,
+            "max_linkedin_invites": 12,
+            "max_linkedin_followups": 8,
+            "max_company_mapping": 5,
+            "max_email_research": 5,
+            "max_context_enrichment": 8,
+            "note": (
+                "Fixed Track 2 nightly defaults. The exact run may further "
+                "constrain these budgets at execution time."
+            ),
         }
+        empty = {
+            "budgets": budgets,
+            "queue_items": [],
+            "queue_items_returned": 0,
+            "queue_items_total": 0,
+            "queue_items_truncated": False,
+            "queue_items_limit": _NEXT_RUN_QUEUE_LIMIT,
+            "queue_items_status": "unavailable",
+            "queue_items_reason": (
+                "No exact action-queue artifact is bound to a verified run yet."
+            ),
+            "plan_status": "unavailable",
+            "plan_reason": "No exact Track 2 daily plan is bound yet.",
+        }
+        if latest is None or not self.settings.resumegen_root:
+            return empty
+        run_id = str(latest.get("run_id") or "")
+        evidence = latest.get("evidence")
+        exact_evidence = evidence if isinstance(evidence, dict) else {}
+        action_evidence = exact_evidence.get("action_queue")
+        if not isinstance(action_evidence, dict):
+            empty["queue_items_reason"] = (
+                f"Exact run {run_id or 'unknown'} is missing action-queue evidence."
+            )
+            return empty
+        try:
+            relative = str(action_evidence.get("path") or "")
+            if not relative or ".." in relative or relative.startswith("/"):
+                raise ValueError("action queue evidence path is unsafe")
+            action_path = _strict_allowlisted_path(
+                self.settings.resumegen_root,
+                self.settings.resumegen_root / relative,
+                expect="file",
+            )
+            action_queue = ExistingEngineAdapter._read_bound_object(
+                action_path,
+                action_evidence,
+                "verified action queue",
+            )
+            _validated_action_queue_lane_counts(action_queue)
+            queue_sha = action_evidence.get("sha256")
+            queue_items, _ = _project_next_run_queue_items(
+                action_queue,
+                run_id=run_id,
+                sha256=queue_sha if isinstance(queue_sha, str) else "",
+                limit=_NEXT_RUN_QUEUE_LIMIT,
+            )
+        except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            empty["queue_items_status"] = "partial"
+            empty["queue_items_reason"] = (
+                "Exact action-queue rows failed closed: "
+                f"{type(error).__name__}"
+            )
+            return empty
+
+        plan_status = "unavailable"
+        plan_reason = ""
+        plan_entries: list[dict[str, Any]] = []
+        plan_sha = ""
+        try:
+            plan, plan_sha = self._exact_track_2_plan(exact_evidence)
+            plan_entries = _project_track_2_plan_entries(plan)
+            plan_budget = plan.get("budget")
+            if isinstance(plan_budget, dict):
+                for key in (
+                    "max_total_actions",
+                    "max_companies",
+                    "max_linkedin_invites",
+                    "max_linkedin_followups",
+                    "max_company_mapping",
+                    "max_email_research",
+                    "max_context_enrichment",
+                    "max_email_drafts",
+                ):
+                    value = _bounded_operator_count(plan_budget.get(key))
+                    if value is not None:
+                        budgets[key] = value
+                budgets["source"] = "exact_track_2_daily_plan"
+                budgets["note"] = (
+                    "Exact Track 2 plan budgets from the verified basis run. "
+                    "The next run rebuilds its plan at execution time."
+                )
+            plan_status = "bound"
+        except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            plan_reason = (
+                "Track 2 daily plan enrichment failed closed: "
+                f"{type(error).__name__}"
+            )
+
+        items, total = _combine_plan_and_queue_rows(
+            plan_entries,
+            queue_items,
+            run_id=run_id,
+            plan_sha256=plan_sha,
+            limit=_NEXT_RUN_QUEUE_LIMIT,
+        )
+        return {
+            "budgets": budgets,
+            "queue_items": items,
+            "queue_items_returned": len(items),
+            "queue_items_total": total,
+            "queue_items_truncated": total > _NEXT_RUN_QUEUE_LIMIT,
+            "queue_items_limit": _NEXT_RUN_QUEUE_LIMIT,
+            "queue_items_status": "available",
+            "queue_items_reason": "",
+            "plan_status": plan_status,
+            "plan_reason": plan_reason,
+        }
+
+    def _exact_track_2_plan(
+        self,
+        exact_evidence: dict[str, Any],
+    ) -> tuple[dict[str, Any], str]:
+        """Resolve the Track 2 daily plan bound to the exact verified manifest."""
+        if not self.settings.resumegen_root or not self.settings.outreach_root:
+            raise ValueError("workspace roots are not configured")
+        manifest_evidence = exact_evidence.get("daily_manifest")
+        if not isinstance(manifest_evidence, dict):
+            raise ValueError("exact run is missing daily-manifest evidence")
+        relative = str(manifest_evidence.get("path") or "")
+        if not relative or ".." in relative or relative.startswith("/"):
+            raise ValueError("daily manifest evidence path is unsafe")
+        manifest_path = _strict_allowlisted_path(
+            self.settings.resumegen_root,
+            self.settings.resumegen_root / relative,
+            expect="file",
+        )
+        manifest = ExistingEngineAdapter._read_bound_object(
+            manifest_path,
+            manifest_evidence,
+            "verified daily manifest",
+        )
+        pointers = manifest.get("track_2_daily_run_artifacts")
+        if not isinstance(pointers, list) or not pointers:
+            raise ValueError("manifest has no Track 2 daily-run artifact")
+        run_path = _resolve_exact_artifact(
+            self.settings.outreach_root, pointers[-1]
+        )
+        run_payload = json.loads(
+            _read_bounded_bytes(run_path, limit=8 * 1024 * 1024).decode("utf-8")
+        )
+        if not isinstance(run_payload, dict):
+            raise ValueError("Track 2 daily-run artifact is not an object")
+        plan_path = _resolve_exact_artifact(
+            self.settings.outreach_root, run_payload.get("plan_artifact")
+        )
+        plan_bytes = _read_bounded_bytes(plan_path, limit=8 * 1024 * 1024)
+        plan = json.loads(plan_bytes.decode("utf-8"))
+        if not isinstance(plan, dict):
+            raise ValueError("Track 2 daily plan artifact is not an object")
+        return plan, hashlib.sha256(plan_bytes).hexdigest()
 
     @staticmethod
     def _account_tracker_surface(
@@ -7066,6 +7247,248 @@ def _allowlisted_numeric_mapping(value: Any, allowed: set[str]) -> dict[str, Any
         if isinstance((number := value.get(key)), (int, float))
         and not isinstance(number, bool)
     }
+
+
+_NEXT_RUN_QUEUE_LANES = (
+    (
+        "application_plus_outreach",
+        "next-nightly",
+    ),
+    (
+        "application_only",
+        "current-apply-queue",
+    ),
+    (
+        "outreach_only_today",
+        "next-nightly",
+    ),
+    (
+        "relationship_buffer",
+        "next-nightly",
+    ),
+    (
+        "follow_up",
+        "next-nightly",
+    ),
+)
+
+
+def _safe_queue_text(value: Any, *, limit: int = 160) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _safe_fit_score(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if number < 0 or number > 100:
+        return None
+    return round(number, 2)
+
+
+def _project_next_run_queue_items(
+    action_queue: dict[str, Any],
+    *,
+    run_id: str,
+    sha256: str,
+    limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    projected: list[dict[str, Any]] = []
+    for lane, target_run in _NEXT_RUN_QUEUE_LANES:
+        entries = action_queue.get(lane)
+        if not isinstance(entries, list):
+            continue
+        for index, raw in enumerate(entries):
+            if not isinstance(raw, dict):
+                continue
+            company = _safe_queue_text(raw.get("company"), limit=80)
+            if not company:
+                continue
+            role_title = _safe_queue_text(
+                raw.get("role_title") or raw.get("role") or raw.get("target_role"),
+                limit=120,
+            )
+            reasons_raw = raw.get("reasons")
+            reasons: list[str] = []
+            if isinstance(reasons_raw, list):
+                for reason in reasons_raw[:6]:
+                    cleaned = _safe_queue_text(reason, limit=100)
+                    if cleaned:
+                        reasons.append(cleaned)
+            elif isinstance(reasons_raw, str):
+                cleaned = _safe_queue_text(reasons_raw, limit=100)
+                if cleaned:
+                    reasons.append(cleaned)
+            source = _safe_queue_text(raw.get("source") or raw.get("lane_source"), limit=64)
+            recommended_action = _safe_queue_text(
+                raw.get("recommended_action") or raw.get("campaign_action"),
+                limit=64,
+            )
+            queue_rank = _bounded_operator_count(raw.get("queue_rank"))
+            projected.append(
+                {
+                    "id": f"{lane}:{index}:{company.casefold()}",
+                    "rank": len(projected) + 1,
+                    "company": company,
+                    "role_title": role_title,
+                    "lane": lane,
+                    "target_run": target_run,
+                    "reasons": reasons,
+                    "fit_score": _safe_fit_score(raw.get("fit_score")),
+                    "queue_rank": queue_rank,
+                    "recommended_action": recommended_action,
+                    "source": source,
+                    "evidence": {
+                        "kind": "exact_action_queue_item",
+                        "run_id": run_id,
+                        "lane": lane,
+                        "sha256": (
+                            sha256
+                            if isinstance(sha256, str)
+                            and re.fullmatch(r"[0-9a-f]{64}", sha256)
+                            else ""
+                        ),
+                    },
+                }
+            )
+    total = len(projected)
+    return projected[:limit], total
+
+
+_PLAN_COUNT_LABELS = (
+    ("expected_linkedin_invites", "invites", "invite"),
+    ("expected_linkedin_followups", "follow-ups", "follow-up"),
+    ("expected_company_mapping", "mapping passes", "mapping pass"),
+    ("expected_email_research", "email research passes", "email research pass"),
+    ("expected_context_enrichment", "context enrichments", "context enrichment"),
+    ("expected_email_drafts", "email drafts", "email draft"),
+)
+
+
+def _planned_action_summary(action: str, counts: dict[str, int]) -> str:
+    verb = action.replace("_", " ").strip() or "queued action"
+    parts: list[str] = []
+    for key, plural, singular in _PLAN_COUNT_LABELS:
+        count = counts.get(key.removeprefix("expected_"), 0)
+        if count > 0:
+            parts.append(f"{count} {singular if count == 1 else plural}")
+    if not parts:
+        return verb
+    return f"{verb} · {', '.join(parts)}"
+
+
+def _project_track_2_plan_entries(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Project the plan's selected companies with actions and expected counts."""
+    selected = plan.get("selected")
+    if not isinstance(selected, list):
+        return []
+    entries: list[dict[str, Any]] = []
+    for raw in selected:
+        if not isinstance(raw, dict):
+            continue
+        company = _safe_queue_text(raw.get("company"), limit=80)
+        if not company:
+            continue
+        action = _safe_queue_text(raw.get("campaign_action"), limit=64)
+        counts: dict[str, int] = {}
+        for key, _plural, _singular in _PLAN_COUNT_LABELS:
+            value = _bounded_operator_count(raw.get(key))
+            if value:
+                counts[key.removeprefix("expected_")] = value
+        entries.append(
+            {
+                "company": company,
+                "role_title": _safe_queue_text(raw.get("target_role"), limit=120),
+                "planned_action": action,
+                "planned_channel": _safe_queue_text(
+                    raw.get("campaign_channel"), limit=32
+                ),
+                "plan_phase": _safe_queue_text(raw.get("phase"), limit=64),
+                "planned_counts": counts,
+                "action_summary": _planned_action_summary(action, counts),
+                "tier": _safe_queue_text(raw.get("tier"), limit=8),
+                "account_score": _bounded_operator_count(raw.get("account_score")),
+                "reason": _safe_queue_text(raw.get("reason"), limit=140),
+            }
+        )
+    return entries
+
+
+def _combine_plan_and_queue_rows(
+    plan_entries: list[dict[str, Any]],
+    queue_items: list[dict[str, Any]],
+    *,
+    run_id: str,
+    plan_sha256: str,
+    limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Rank plan-selected companies first, then unplanned action-queue rows.
+
+    Plan rows carry the concrete planned action and expected counts; queue
+    rows that match a planned company enrich the plan row instead of
+    duplicating the company in the list.
+    """
+    queue_by_company: dict[str, dict[str, Any]] = {}
+    for item in queue_items:
+        key = str(item.get("company") or "").casefold()
+        if key and key not in queue_by_company:
+            queue_by_company[key] = item
+    plan_sha = (
+        plan_sha256
+        if isinstance(plan_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", plan_sha256)
+        else ""
+    )
+    combined: list[dict[str, Any]] = []
+    matched: set[str] = set()
+    for index, entry in enumerate(plan_entries):
+        key = entry["company"].casefold()
+        queue_match = queue_by_company.get(key)
+        if queue_match is not None:
+            matched.add(key)
+        row = {
+            "id": f"track_2_plan:{index}:{key}",
+            "rank": len(combined) + 1,
+            "company": entry["company"],
+            "role_title": entry["role_title"]
+            or str((queue_match or {}).get("role_title") or ""),
+            "lane": "track_2_plan",
+            "target_run": "next-nightly",
+            "reasons": [entry["reason"]] if entry["reason"] else [],
+            "fit_score": (queue_match or {}).get("fit_score"),
+            "queue_rank": (queue_match or {}).get("queue_rank"),
+            "recommended_action": entry["planned_action"],
+            "source": "track_2_daily_plan",
+            "planned_action": entry["planned_action"],
+            "planned_channel": entry["planned_channel"],
+            "plan_phase": entry["plan_phase"],
+            "planned_counts": entry["planned_counts"],
+            "action_summary": entry["action_summary"],
+            "tier": entry["tier"],
+            "account_score": entry["account_score"],
+            "evidence": {
+                "kind": "exact_track_2_plan_item",
+                "run_id": run_id,
+                "lane": "track_2_plan",
+                "sha256": plan_sha,
+            },
+        }
+        combined.append(row)
+    for item in queue_items:
+        key = str(item.get("company") or "").casefold()
+        if key in matched:
+            continue
+        row = dict(item)
+        row["rank"] = len(combined) + 1
+        combined.append(row)
+    total = len(combined)
+    return combined[:limit], total
 
 
 def _bounded_operator_count(value: Any) -> int | None:

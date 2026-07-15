@@ -140,11 +140,20 @@ _APPLY_ASSIST_BLOCKED_REASON = (
     "acceptable human-submit boundary."
 )
 _REQUIRED_PRODUCTION_NIGHTLY_FLAGS = {
+    "--execute-track-2-daily-plan",
+    "--track-2-send-linkedin",
+}
+# The upstream contract emits exactly one of two reviewed evening shapes:
+# discovery (Daily Engine lane included, one run in every four) or
+# delivery-only maintenance (discovery explicitly skipped).
+_DISCOVERY_NIGHTLY_FLAGS = {
     "--generate",
     "--prepare-outreach",
     "--execute-sends",
-    "--execute-track-2-daily-plan",
-    "--track-2-send-linkedin",
+}
+_MAINTENANCE_NIGHTLY_FLAGS = {
+    "--skip-daily-engine",
+    "--skip-shared-discovery",
 }
 _FORBIDDEN_PRODUCTION_NIGHTLY_FLAGS = {"--execute-linkedin-followups"}
 _MAX_NIGHTLY_CONTRACT_OUTPUT_BYTES = 16 * 1024
@@ -1665,6 +1674,8 @@ class OperatorBackend:
             "--pipeline-args",
             pipeline_args,
         ]
+        contract_tokens = list(contract["pipeline_args"])
+        includes_discovery = "--generate" in contract_tokens
         binding = {
             "release_attestation_sha256": attestation_sha,
             "nightly_prompt_sha256": script_sha,
@@ -1676,20 +1687,32 @@ class OperatorBackend:
             "pipeline_args": contract["pipeline_args"],
             "pipeline_args_string": pipeline_args,
             "delivery_flags": {
-                "execute_sends": True,
+                "execute_sends": includes_discovery,
                 "track_2_send_linkedin": True,
                 "execute_linkedin_followups": False,
             },
+            "includes_discovery": includes_discovery,
             "maximum_runs": 1,
         }
         artifact_sha = _canonical_binding_sha(binding)
+        lane_label = (
+            "discovery + delivery" if includes_discovery else "delivery-only"
+        )
+        lane_detail = (
+            "App-queue invitations and Track 2 LinkedIn invitations, replies, "
+            "and follow-ups are enabled"
+            if includes_discovery
+            else "Discovery is skipped this cycle by the reviewed 1-in-4 cadence; "
+            "Track 2 LinkedIn invitations, replies, and follow-ups are enabled"
+        )
         target = self._make_review_target(
             command_id="nightly.run",
             target_type="production_nightly_release",
-            label=f"Production nightly · release {attestation_sha[:12]}",
+            label=(
+                f"Production nightly ({lane_label}) · release {attestation_sha[:12]}"
+            ),
             detail=(
-                "One bounded production run. App-queue invitations and Track 2 "
-                "LinkedIn invitations, replies, and follow-ups are enabled; email "
+                f"One bounded production run. {lane_detail}; email "
                 "delivery remains separately recipient-reviewed."
             ),
             artifact_sha256=artifact_sha,
@@ -1804,15 +1827,33 @@ class OperatorBackend:
             raise ValidationError(
                 "canonical production-nightly argv enables the deprecated follow-up lane"
             )
-        for flag in _REQUIRED_PRODUCTION_NIGHTLY_FLAGS:
+        discovery_shape = _DISCOVERY_NIGHTLY_FLAGS.issubset(present)
+        maintenance_shape = _MAINTENANCE_NIGHTLY_FLAGS.issubset(present)
+        if discovery_shape == maintenance_shape:
+            raise ValidationError(
+                "canonical production-nightly argv must be exactly one reviewed "
+                "shape: discovery or delivery-only maintenance"
+            )
+        if discovery_shape and _MAINTENANCE_NIGHTLY_FLAGS.intersection(present):
+            raise ValidationError(
+                "canonical production-nightly argv mixes discovery and skip flags"
+            )
+        if maintenance_shape and _DISCOVERY_NIGHTLY_FLAGS.intersection(present):
+            raise ValidationError(
+                "canonical production-nightly argv mixes maintenance and discovery flags"
+            )
+        exact_once_flags = set(_REQUIRED_PRODUCTION_NIGHTLY_FLAGS) | (
+            _DISCOVERY_NIGHTLY_FLAGS if discovery_shape else _MAINTENANCE_NIGHTLY_FLAGS
+        )
+        for flag in exact_once_flags:
             if tokens.count(flag) != 1:
                 raise ValidationError(
                     "canonical production-nightly argv repeats a live-delivery gate"
                 )
-        for option, expected in (
-            ("--cycle-config", "offcycle_light"),
-            ("--target-sends", "auto"),
-        ):
+        required_options = [("--cycle-config", "offcycle_light")]
+        if discovery_shape:
+            required_options.append(("--target-sends", "auto"))
+        for option, expected in required_options:
             try:
                 index = tokens.index(option)
                 actual = tokens[index + 1]

@@ -2920,6 +2920,45 @@ class GuardedOperatorActionTestCase(unittest.TestCase):
         raise AssertionError("operator background job did not finish")
 
 
+class NightlyContractShapeTestCase(unittest.TestCase):
+    _DISCOVERY = (
+        "--generate --prepare-outreach --execute-sends --target-sends auto "
+        "--cycle-config offcycle_light --execute-track-2-daily-plan "
+        "--track-2-send-linkedin"
+    )
+    _MAINTENANCE = (
+        "--skip-daily-engine --skip-shared-discovery "
+        "--cycle-config offcycle_light --execute-track-2-daily-plan "
+        "--track-2-send-linkedin"
+    )
+
+    def test_both_reviewed_evening_shapes_are_accepted(self) -> None:
+        for shape in (self._DISCOVERY, self._MAINTENANCE):
+            OperatorBackend._validate_production_nightly_tokens(shape.split())
+
+    def test_mixed_or_shapeless_vectors_are_rejected(self) -> None:
+        mixed = self._DISCOVERY + " --skip-daily-engine --skip-shared-discovery"
+        shapeless = (
+            "--cycle-config offcycle_light --execute-track-2-daily-plan "
+            "--track-2-send-linkedin"
+        )
+        partial_discovery = self._DISCOVERY.replace("--generate ", "")
+        for candidate in (mixed, shapeless, partial_discovery):
+            with self.assertRaises(ValidationError):
+                OperatorBackend._validate_production_nightly_tokens(
+                    candidate.split()
+                )
+
+    def test_discovery_shape_still_requires_auto_target_sends(self) -> None:
+        unsafe = self._DISCOVERY.replace("--target-sends auto", "--target-sends 50")
+        with self.assertRaises(ValidationError):
+            OperatorBackend._validate_production_nightly_tokens(unsafe.split())
+        # Maintenance omits --target-sends entirely and must stay valid.
+        OperatorBackend._validate_production_nightly_tokens(
+            self._MAINTENANCE.split()
+        )
+
+
 class ExistingAdapterTestCase(unittest.TestCase):
     def test_pointer_containment_accepts_case_variant_root_by_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

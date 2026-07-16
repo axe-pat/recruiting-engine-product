@@ -758,7 +758,11 @@ class OperatorBackend:
         }
 
     def exact_report_html(self, run_id: str) -> dict[str, Any]:
-        """Return one immutable, verified run report for the paired web client."""
+        """Return one immutable run report for the paired web client.
+
+        Prefers fully verified runs; falls back to incomplete runs that still
+        have a bound HTML report (delivery-only / offcycle nights).
+        """
         if not re.fullmatch(r"\d{8}-\d{6}", run_id):
             raise NotFoundError("verified report not found")
         if not self.settings.outreach_root:
@@ -769,6 +773,12 @@ class OperatorBackend:
             for projection in self.adapter.verified_run_projections(limit=50)
             if projection.get("run_id") == run_id
         ]
+        if not matches:
+            matches = [
+                projection
+                for projection in self.adapter.reportable_run_projections(limit=50)
+                if projection.get("run_id") == run_id
+            ]
         if not matches:
             raise NotFoundError("verified report not found")
         if len(matches) != 1:
@@ -817,6 +827,19 @@ class OperatorBackend:
     ) -> dict[str, Any]:
         run_projections = self.adapter.verified_run_projections(
             limit=_REPORT_ITEM_LIMIT
+        )
+        incomplete_reports = self.adapter.reportable_run_projections(
+            limit=_REPORT_ITEM_LIMIT
+        )
+        report_list = list(run_projections)
+        seen = {str(item.get("run_id") or "") for item in report_list}
+        for item in incomplete_reports:
+            run_id = str(item.get("run_id") or "")
+            if run_id and run_id not in seen:
+                report_list.append(item)
+                seen.add(run_id)
+        report_list.sort(
+            key=lambda item: str(item.get("completed_at") or item.get("started_at") or "")
         )
         lock_states = self.adapter.lock_states()
         capability_projection = capability or self.capabilities(
@@ -982,8 +1005,8 @@ class OperatorBackend:
             capability_projection.get("_verified_run_count")
         )
         reports = self._report_assets(
-            run_projections,
-            items_total=verified_run_count,
+            report_list,
+            items_total=max(len(report_list), verified_run_count or 0),
         )
         sources = self._source_assets(run_projections)
         return {

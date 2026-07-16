@@ -953,15 +953,16 @@ function SourceRows({ items }: { items: UnknownRecord[] }) {
 }
 
 function ReportRows({ items, onOpen, loadingRunId }: { items: UnknownRecord[]; onOpen: (runId: string) => Promise<void>; loadingRunId: string }) {
-  if (!items.length) return <p className="operator-empty-row">No verified daily report is eligible yet.</p>;
+  if (!items.length) return <p className="operator-empty-row">No daily report is eligible yet.</p>;
   return <div className="operator-row-list">{items.map((item, index) => {
     const workspace = asRecord(item.workspace_counts);
     const workspaceDetail = Object.entries(workspace).slice(0, 3).map(([label, value]) => `${label.replaceAll("_", " ")} ${number(value)}`).join(" · ");
     const deliveryMode = text(item.delivery_mode, "not reported").replaceAll("_", " ");
     const reportHealth = text(item.run_status, "not reported").replaceAll("_", " ");
+    const statusLabel = text(item.status, "verified") === "attention" ? "incomplete" : text(item.status, "verified");
     const detail = [deliveryMode, `report ${reportHealth}`, `${number(item.source_count)} sources`, `${number(item.failure_count)} summary failures`, `${number(item.pending_review_count)} pending review`, workspaceDetail].filter(Boolean).join(" · ");
     const runId = text(item.run_id, "");
-    return <article key={runId || `${index}`}><span>{text(item.status, "verified")}</span><div><strong>{runId || "Run ID unavailable"}</strong><p>{detail}</p></div><div className="operator-report-row-actions"><small>{text(item.completed_at ?? item.started_at, "—")}</small><button type="button" disabled={!runId || Boolean(loadingRunId)} onClick={() => void onOpen(runId)}>{loadingRunId === runId ? "Loading…" : "View full report"}</button></div></article>;
+    return <article key={runId || `${index}`}><span>{statusLabel}</span><div><strong>{runId || "Run ID unavailable"}</strong><p>{detail}</p></div><div className="operator-report-row-actions"><small>{text(item.completed_at ?? item.started_at, "—")}</small><button type="button" disabled={!runId || Boolean(loadingRunId)} onClick={() => void onOpen(runId)}>{loadingRunId === runId ? "Loading…" : "View full report"}</button></div></article>;
   })}</div>;
 }
 

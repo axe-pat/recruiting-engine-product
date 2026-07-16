@@ -518,6 +518,137 @@ class ExistingEngineAdapter:
                 continue
         return projections
 
+    def reportable_run_projections(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        """List runs that have a bound HTML report, including incomplete ones.
+
+        Full verification requires the discovery manifest chain. Delivery-only /
+        offcycle runs skip discovery, so they fail that gate even when a usable
+        daily report was written. This surface still lists those reports so the
+        operator UI is not empty after a real Track 2 night.
+
+        Callers that already have verified projections should dedupe by run_id.
+        This method intentionally does not call verified_run_projections, so it
+        can be composed without double-scanning the verified chain.
+        """
+        if not (self.settings.resumegen_root and self.settings.outreach_root):
+            return []
+        directory = self.settings.resumegen_root / "discovery" / "source_validation"
+        if not directory.is_dir():
+            return []
+        projections: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*-nightly-pipeline-summary.json"), reverse=True):
+            match = _SUMMARY_NAME.fullmatch(path.name)
+            if not match:
+                continue
+            run_id = match.group("run_id")
+            try:
+                # Prefer the soft incomplete projection. Fully verified runs are
+                # also reportable this way, but assets() dedupes against the
+                # verified list so verified rows keep their richer projection.
+                projection = self._project_reportable_incomplete_run(path, run_id)
+            except (ValueError, OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            projections.append(projection)
+            if len(projections) >= min(max(int(limit), 1), 50):
+                break
+        return projections
+
+    def _project_reportable_incomplete_run(
+        self, path: Path, run_id: str
+    ) -> dict[str, Any]:
+        assert self.settings.resumegen_root is not None
+        assert self.settings.outreach_root is not None
+        summary, summary_evidence = self._read_object_with_evidence(
+            path, self.settings.resumegen_root
+        )
+        if summary.get("run_id") != run_id:
+            raise ValueError("summary run_id does not match filename")
+        if summary.get("status") not in _SUMMARY_TERMINAL:
+            raise ValueError("summary is not terminal")
+        report_pointer = summary.get("outreach_daily_report")
+        if not isinstance(report_pointer, dict):
+            raise ValueError("summary outreach_daily_report is missing")
+        report_path = self._resolve_pointer(
+            self.settings.outreach_root,
+            report_pointer.get("summary_artifact"),
+            "outreach_daily_report.summary_artifact",
+        )
+        if not report_path.name.startswith(run_id):
+            raise ValueError("outreach report filename does not bind to the selected run")
+        report, report_evidence = self._read_object_with_evidence(
+            report_path, self.settings.outreach_root
+        )
+        self._validate_report(
+            report,
+            summary_path=path,
+            created_at=str(summary.get("created_at") or ""),
+            run_id=run_id,
+        )
+        html_evidence: dict[str, Any] | None = None
+        html_pointer = report_pointer.get("html_report_artifact")
+        if html_pointer:
+            html_path = self._resolve_pointer(
+                self.settings.outreach_root,
+                html_pointer,
+                "outreach_daily_report.html_report_artifact",
+            )
+            if not html_path.name.startswith(run_id):
+                raise ValueError("historical HTML filename does not bind to the run")
+            html_evidence = self._file_evidence(html_path, self.settings.outreach_root)
+        if html_evidence is None:
+            raise ValueError("incomplete run has no HTML report to open")
+        track_2_execution = report.get("track_2_execution")
+        if not isinstance(track_2_execution, dict):
+            track_2_execution = {}
+        failures = summary.get("failures") if isinstance(summary.get("failures"), list) else []
+        evidence = {
+            "summary": summary_evidence,
+            "outreach_report": report_evidence,
+            "outreach_html": html_evidence,
+        }
+        return {
+            "scope": "run-scoped",
+            "status": "attention",
+            "run_id": run_id,
+            "started_at": summary.get("created_at"),
+            "completed_at": summary.get("completed_at"),
+            "failure_count": len([item for item in failures if isinstance(item, str)]),
+            "reporting_consistency": "incomplete_discovery_chain",
+            "delivery_contract": {
+                "mode": str(summary.get("cycle_config") or "not_reported"),
+            },
+            "daily_engine": {
+                "status": str(summary.get("daily_engine_manifest_status") or "skipped"),
+                "returncode": summary.get("daily_engine_returncode"),
+            },
+            "sources": [],
+            "queue": {
+                "counts": {},
+                "decision_total": 0,
+                "decision_total_name": "validated_action_queue_lane_entries",
+                "decision_total_parts": {},
+            },
+            "report": {
+                "status": "valid",
+                "run_status": str(report.get("run_status") or "failed_or_incomplete"),
+                "track_2_status": str(
+                    track_2_execution.get("status") or "not_reported"
+                ),
+                "sources": [],
+                "stage_metrics": {},
+                "workspace_counts": _numeric_tree(report.get("workspace_counts", {})),
+                "invite_totals": _numeric_tree(report.get("invite_totals", {})),
+                "pending_review_count": _safe_int(report.get("pending_review_count")),
+                "track_2_returncode": _safe_int_or_none(
+                    report.get("track_2_returncode")
+                ),
+                "track_2_failed": bool(report.get("track_2_failed", False)),
+                "reporting_consistency": "incomplete_discovery_chain",
+            },
+            "evidence": evidence,
+            "reportable_incomplete": True,
+        }
+
     def _newest_verified_run_projection(self) -> dict[str, Any] | None:
         """Verify newest candidates only until the first complete chain succeeds."""
         if not (

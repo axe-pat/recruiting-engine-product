@@ -64,6 +64,11 @@ class OperatorTruthSurfaceTestCase(unittest.TestCase):
             ) as verified,
             patch.object(
                 self.backend.adapter,
+                "reportable_run_projections",
+                return_value=[],
+            ),
+            patch.object(
+                self.backend.adapter,
                 "run_progress",
                 return_value={"status": "unavailable", "is_current": False},
             ),

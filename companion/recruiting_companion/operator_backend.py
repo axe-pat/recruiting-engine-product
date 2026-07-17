@@ -146,7 +146,7 @@ _REQUIRED_PRODUCTION_NIGHTLY_FLAGS = {
     "--track-2-send-linkedin",
 }
 # The upstream contract emits exactly one of two reviewed evening shapes:
-# discovery (Daily Engine lane included, one run in every four) or
+# discovery (Daily Engine lane included, one run in every three) or
 # delivery-only maintenance (discovery explicitly skipped).
 _DISCOVERY_NIGHTLY_FLAGS = {
     "--generate",
@@ -1727,7 +1727,7 @@ class OperatorBackend:
             "App-queue invitations and Track 2 LinkedIn invitations, replies, "
             "and follow-ups are enabled"
             if includes_discovery
-            else "Discovery is skipped this cycle by the reviewed 1-in-4 cadence; "
+            else "Discovery is skipped this cycle by the reviewed 1-in-3 cadence; "
             "Track 2 LinkedIn invitations, replies, and follow-ups are enabled"
         )
         target = self._make_review_target(
